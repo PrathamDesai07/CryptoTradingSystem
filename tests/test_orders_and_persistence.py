@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from config import get_settings
-from models import Position, PositionStatus, StrategyVariant
+from models import Position, PositionStatus, Signal, SignalAction, StrategyVariant
 from services.order_service import BinanceOrderError, OrderService
 from services.state_repository import StateRepository
 
@@ -46,6 +46,42 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
             await self.service.place_order({"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quoteOrderQty": "10"})
         with self.assertRaises(BinanceOrderError):
             await self.service._normalize_order({"symbol": "BTCUSDT", "side": "BUY", "type": "STOP_LOSS", "quantity": "0.001"})
+
+    async def test_strategy_quantity_updates_and_sizes_market_entry(self):
+        self.service._session_execution_enabled = True
+        submitted = []
+
+        async def place_order(params, test=False):
+            submitted.append(params)
+            return {
+                "executedQty": params["quantity"],
+                "cummulativeQuoteQty": "8",
+            }
+
+        self.service.place_order = place_order
+        await self.service.set_strategy_order_quantity(Decimal("0.0002"))
+        signal = Signal(
+            symbol="BTCUSDT",
+            variant=StrategyVariant.A,
+            action=SignalAction.BUY,
+            price=Decimal("40000"),
+            fast_value=Decimal("40100"),
+            slow_value=Decimal("40000"),
+            reason="test crossover",
+            timestamp=datetime.now(UTC),
+        )
+        await self.service.process_signal(signal)
+
+        self.assertEqual(submitted[0]["type"], "MARKET")
+        self.assertEqual(submitted[0]["quantity"], "0.0002")
+        position = (await self.service.positions("BTCUSDT"))[0]
+        self.assertEqual(position.quantity, Decimal("0.0002"))
+        self.assertEqual(position.stop_loss_price, Decimal("36000"))
+        self.assertEqual(position.take_profit_price, Decimal("42000"))
+
+    async def test_strategy_quantity_must_be_positive(self):
+        with self.assertRaises(BinanceOrderError):
+            await self.service.set_strategy_order_quantity(Decimal("0"))
 
     async def test_fifo_pnl_includes_base_and_quote_fees(self):
         trades = [

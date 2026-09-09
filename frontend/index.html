@@ -64,6 +64,12 @@
                 <span class="indicator-icon" aria-hidden="true">⌁</span>
                 SMA/EMA off
               </button>
+              <label class="strategy-quantity" title="Quantity used by future automatic SMA/EMA market orders">
+                <span>Auto qty</span>
+                <input id="strategy-order-quantity" type="number" inputmode="decimal" min="0" step="0.00001" aria-label="Automatic strategy order quantity" />
+                <strong id="strategy-order-asset">BTC</strong>
+              </label>
+              <span id="strategy-quantity-status" class="strategy-quantity-status" aria-live="polite"></span>
             </div>
             <div id="indicator-legend" class="indicator-legend" hidden>
               <span><i class="sma-dot"></i>SMA <b id="sma-period">--</b> close <strong id="sma-value">--</strong></span>

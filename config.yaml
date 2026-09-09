@@ -61,6 +61,8 @@ frontend_tick_poll_seconds: 5
 frontend_broadcast_interval_milliseconds: 100
 order_book_render_interval_milliseconds: 500
 order_size_usdt: 10
+# Base-asset quantity used by automatic SMA/EMA strategy MARKET entries.
+strategy_order_quantity: 0.0001
 order_request_timeout_seconds: 10
 order_recv_window_milliseconds: 5000
 exchange_info_cache_seconds: 3600

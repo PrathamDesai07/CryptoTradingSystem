@@ -84,6 +84,11 @@ button.secondary.active { color: #f1c40f; border-color: #f1c40f; background: rgb
 .trading-workspace { display: grid; grid-template-columns: minmax(0, 2.25fr) minmax(390px, 1fr); gap: 8px; margin-top: 18px; }
 .chart-pane, .book-pane { min-width: 0; background: #091424; border: 1px solid #2a3a52; border-radius: 10px; overflow: hidden; box-shadow: 0 14px 28px rgba(0, 0, 0, .18); }
 .chart-toolbar { display: flex; align-items: center; gap: 6px; min-height: 48px; padding: 7px 14px; border-bottom: 1px solid var(--line); background: #0b1421; overflow-x: auto; }
+.strategy-quantity { display: flex; align-items: center; gap: 6px; margin-left: auto; padding: 4px 7px; border: 1px solid #293a53; border-radius: 6px; color: #8190a5; font-size: .7rem; white-space: nowrap; }
+.strategy-quantity:focus-within { border-color: #4c7fc4; }
+.strategy-quantity input { width: 92px; border: 0; padding: 3px 2px; background: transparent; color: var(--text); font: inherit; font-variant-numeric: tabular-nums; outline: none; }
+.strategy-quantity strong { color: #b8c5d6; font-size: .67rem; }
+.strategy-quantity-status { min-width: 36px; color: var(--accent); font-size: .66rem; white-space: nowrap; }
 .toolbar-label { flex: 0 0 auto; margin-right: 3px; color: #75849a; font-size: .76rem; }
 .timeframe-options { display: flex; align-self: stretch; gap: 1px; }
 .timeframe-button, .chart-tool { position: relative; border: 0; border-radius: 5px; padding: 6px 8px; background: transparent; color: #75849a; font-size: .76rem; font-weight: 650; white-space: nowrap; }

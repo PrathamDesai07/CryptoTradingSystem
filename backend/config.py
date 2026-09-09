@@ -73,6 +73,7 @@ class Settings(BaseModel):
     frontend_broadcast_interval_milliseconds: int = Field(ge=16, le=5000)
     order_book_render_interval_milliseconds: int = Field(ge=100, le=5000)
     order_size_usdt: float = Field(gt=0)
+    strategy_order_quantity: float = Field(gt=0)
     order_request_timeout_seconds: float = Field(gt=0, le=60)
     order_recv_window_milliseconds: int = Field(ge=1, le=60000)
     exchange_info_cache_seconds: int = Field(ge=1, le=86400)

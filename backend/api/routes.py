@@ -1,6 +1,7 @@
 """REST and WebSocket endpoints exposed to the frontend."""
 
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -61,6 +62,10 @@ class RuntimeCredentialsRequest(BaseModel):
     api_secret: str
 
 
+class StrategyOrderQuantityRequest(BaseModel):
+    quantity: Decimal
+
+
 class OrderListRequest(BaseModel):
     type: str
     parameters: dict[str, object]
@@ -98,7 +103,22 @@ async def public_config(request: Request) -> dict[str, object]:
         "slow_ema_period": settings.slow_ema_period,
         "chart_intervals": settings.chart_intervals,
         "order_execution_enabled": settings.order_execution_enabled,
+        "strategy_order_quantity": request.app.state.order_service.strategy_order_quantity,
     }
+
+
+@router.put("/strategy/order-quantity")
+async def update_strategy_order_quantity(
+    payload: StrategyOrderQuantityRequest, request: Request
+) -> dict[str, object]:
+    """Change sizing for future automatic strategy orders in this process."""
+    try:
+        quantity = await request.app.state.order_service.set_strategy_order_quantity(
+            payload.quantity
+        )
+    except BinanceOrderError as error:
+        raise order_error(error) from error
+    return {"quantity": quantity, "persistence": "until_backend_restart"}
 
 
 @router.get("/symbols")

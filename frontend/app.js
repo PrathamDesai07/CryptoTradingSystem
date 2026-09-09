@@ -40,6 +40,7 @@ const state = {
   orderPnl: new Map(),
   pnlBasis: null,
   recentOrders: [],
+  strategyOrderQuantity: null,
 };
 const elements = {
   title: document.querySelector("#app-title"),
@@ -109,6 +110,9 @@ const elements = {
   orderTicket: document.querySelector("#order-ticket"),
   closeOrderTicket: document.querySelector("#close-order-ticket"),
   showOrderTicket: document.querySelector("#show-order-ticket"),
+  strategyOrderQuantity: document.querySelector("#strategy-order-quantity"),
+  strategyOrderAsset: document.querySelector("#strategy-order-asset"),
+  strategyQuantityStatus: document.querySelector("#strategy-quantity-status"),
 };
 
 async function request(path, options = {}) {
@@ -222,6 +226,8 @@ async function loadPublicConfig() {
   state.orderBookRenderIntervalMilliseconds = config.order_book_render_interval_milliseconds;
   state.fastSmaPeriod = config.fast_sma_period;
   state.slowEmaPeriod = config.slow_ema_period;
+  state.strategyOrderQuantity = Number(config.strategy_order_quantity);
+  elements.strategyOrderQuantity.value = String(config.strategy_order_quantity);
   state.chartIntervals = Array.isArray(config.chart_intervals) && config.chart_intervals.length
     ? config.chart_intervals
     : ["1m"];
@@ -239,6 +245,34 @@ async function loadPublicConfig() {
   elements.submitOrder.disabled = false;
   renderTimeframeOptions();
 }
+
+async function saveStrategyOrderQuantity() {
+  const quantity = Number(elements.strategyOrderQuantity.value);
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    elements.strategyQuantityStatus.textContent = "Invalid";
+    return;
+  }
+  elements.strategyQuantityStatus.textContent = "Saving…";
+  try {
+    const response = await request("strategy/order-quantity", {
+      method: "PUT",
+      body: JSON.stringify({ quantity: elements.strategyOrderQuantity.value }),
+    });
+    state.strategyOrderQuantity = Number(response.quantity);
+    elements.strategyOrderQuantity.value = String(response.quantity);
+    elements.strategyQuantityStatus.textContent = "Saved";
+  } catch (error) {
+    elements.strategyQuantityStatus.textContent = error.message;
+  }
+}
+
+elements.strategyOrderQuantity.addEventListener("change", saveStrategyOrderQuantity);
+elements.strategyOrderQuantity.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    elements.strategyOrderQuantity.blur();
+  }
+});
 
 async function loadOrderSession() {
   const session = await request("order-session");
@@ -362,6 +396,9 @@ async function selectSymbol(symbol) {
   document.body.classList.add("trading-mode");
   elements.detail.hidden = false;
   elements.detailSymbol.textContent = symbol;
+  elements.strategyOrderAsset.textContent = symbol.endsWith("USDT")
+    ? symbol.slice(0, -4)
+    : "units";
   renderMarketHeader();
   renderMarketTabs();
   elements.bookTime.textContent = "Waiting for Binance...";

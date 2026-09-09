@@ -57,6 +57,7 @@ class OrderService:
         self._runtime_api_key: SecretStr | None = None
         self._runtime_api_secret: SecretStr | None = None
         self._session_execution_enabled = False
+        self._strategy_order_quantity = Decimal(str(settings.strategy_order_quantity))
         self._squared_orders: set[tuple[str, int]] = set()
         self._repository = StateRepository(settings.state_database_path, settings.strategy_signal_history_size)
         for record in self._repository.load_orders():
@@ -78,6 +79,19 @@ class OrderService:
     @property
     def runtime_session_active(self) -> bool:
         return bool(self._runtime_api_key and self._runtime_api_secret and self._session_execution_enabled)
+
+    @property
+    def strategy_order_quantity(self) -> Decimal:
+        """Return the process-local quantity used for new strategy entries."""
+        return self._strategy_order_quantity
+
+    async def set_strategy_order_quantity(self, quantity: Decimal) -> Decimal:
+        """Update automatic entry sizing for subsequent signals only."""
+        if not quantity.is_finite() or quantity <= 0:
+            raise BinanceOrderError("strategy order quantity must be greater than zero", 422)
+        async with self._lock:
+            self._strategy_order_quantity = quantity
+            return self._strategy_order_quantity
 
     async def connect_credentials(self, api_key: str, api_secret: str) -> dict[str, Any]:
         """Validate and retain credentials only for this backend process."""
@@ -386,7 +400,9 @@ class OrderService:
                 self._inflight.discard(key)
 
     async def _enter(self, signal: Signal) -> None:
-        response = await self.place_order({"symbol": signal.symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": str(self._settings.order_size_usdt), "newClientOrderId": self._client_id(signal, "B"), "newOrderRespType": "FULL"})
+        async with self._lock:
+            quantity = self._strategy_order_quantity
+        response = await self.place_order({"symbol": signal.symbol, "side": "BUY", "type": "MARKET", "quantity": str(quantity), "newClientOrderId": self._client_id(signal, "B"), "newOrderRespType": "FULL"})
         quantity, price = self._execution(response, signal.price)
         if quantity <= 0:
             return
