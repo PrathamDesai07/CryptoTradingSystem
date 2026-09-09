@@ -1,0 +1,32 @@
+# Non-secret application configuration. Override any setting with an uppercase
+# environment variable of the same name. Keep real credentials in `.env`.
+
+app_environment: development
+app_title: Crypto Trading System API
+root_message: Crypto Trading System API
+app_host: 127.0.0.1
+app_port: 8000
+log_level: INFO
+api_prefix: /api
+docs_url: /docs
+redoc_url: /redoc
+cors_origins: http://localhost:3000,http://127.0.0.1:3000
+cors_allow_credentials: false
+cors_allow_methods:
+  - "*"
+cors_allow_headers:
+  - "*"
+
+binance_api_key: ${BINANCE_API_KEY:-}
+binance_api_secret: ${BINANCE_API_SECRET:-}
+binance_testnet_rest_url: https://testnet.binance.vision
+binance_testnet_ws_url: wss://testnet.binance.vision/ws
+
+trading_symbols: BTCUSDT,ETHUSDT
+order_size_usdt: 10
+fast_sma_period: 5
+slow_ema_period: 10
+variant_a_stop_loss_percent: 10
+variant_b_stop_loss_percent: 15
+take_profit_percent: 5
+order_execution_enabled: false
