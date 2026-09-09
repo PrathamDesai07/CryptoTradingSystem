@@ -47,3 +47,32 @@ class Candle(BaseModel):
         if self.low > min(self.open, self.close, self.high):
             raise ValueError("low must be the smallest OHLC value")
         return self
+
+
+class OrderBookLevel(BaseModel):
+    """One price level in a partial order-book snapshot."""
+
+    model_config = ConfigDict(frozen=True)
+
+    price: PositiveDecimal
+    quantity: NonNegativeDecimal
+
+
+class PartialOrderBook(BaseModel):
+    """The latest bounded set of best bid and ask levels for a symbol."""
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: Symbol
+    last_update_id: int = Field(ge=0)
+    timestamp: UtcDateTime
+    bids: tuple[OrderBookLevel, ...]
+    asks: tuple[OrderBookLevel, ...]
+
+    @model_validator(mode="after")
+    def validate_ordering(self) -> "PartialOrderBook":
+        if any(left.price < right.price for left, right in zip(self.bids, self.bids[1:])):
+            raise ValueError("bids must be ordered from highest to lowest price")
+        if any(left.price > right.price for left, right in zip(self.asks, self.asks[1:])):
+            raise ValueError("asks must be ordered from lowest to highest price")
+        return self

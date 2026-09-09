@@ -2,11 +2,7 @@
 
 A real-time crypto trading system that consumes public Binance Spot market data,
 builds one-minute OHLC candles, runs two SMA/EMA strategy variants, places sample
-orders on Binance Testnet, and exposes the system state to a JavaScript frontend.
-
-> This repository currently contains only the initial project structure and
-> placeholder API/frontend files. The features below are the implementation
-> roadmap, not completed functionality.
+orders on Binance Spot Demo Mode, and exposes the system state to a JavaScript frontend.
 
 ## Target architecture
 
@@ -23,7 +19,7 @@ Binance Spot public WebSocket
                                REST/WebSocket API   Order service
                                       |               |
                                       v               v
-                               JS frontend       Binance Testnet REST API
+                               JS frontend       Binance Demo REST API
                                                       |
                                                       v
                                                    Trade log
@@ -45,7 +41,8 @@ backend/
     |-- market_data.py         # Binance WebSocket connection and tick handling
     |-- candle_service.py      # One-minute OHLC aggregation
     |-- strategy_service.py    # SMA/EMA calculations and signals
-    |-- order_service.py       # Binance Testnet order placement
+    |-- order_service.py       # Binance Demo orders, risk, P&L, and order lists
+    |-- state_repository.py    # SQLite order/position persistence
     `-- __init__.py
 
 frontend/
@@ -113,9 +110,10 @@ creates a local `.env` from `.env.example` when missing, starts the backend, and
 opens the API-served JavaScript dashboard. The backend and frontend share one
 process, so pressing `Ctrl+C` stops the complete application.
 
-Before entering real Testnet credentials in `.env`, confirm that `.env` remains
-ignored by Git. Keep `ORDER_EXECUTION_ENABLED=false` until the order service is
-implemented and deliberately tested.
+Credentials can be entered in the dashboard when the first order is submitted.
+They are verified against Demo Mode, retained only in backend process memory,
+and cleared at shutdown. `.env` remains supported for unattended local testing
+and is ignored by Git.
 
 #### Configuration behavior
 
@@ -147,7 +145,7 @@ implemented and deliberately tested.
 
 ### Phase 3: Binance market-data ingestion
 
-- [x] Connect to the Binance Testnet WebSocket market stream.
+- [x] Connect to Binance's public production WebSocket for read-only live prices.
 - [x] Subscribe to BTCUSDT and ETHUSDT initially.
 - [x] Normalize Binance symbols consistently throughout the application.
 - [x] Parse and validate every incoming tick.
@@ -179,15 +177,21 @@ Implementation notes:
 
 ### Phase 4: One-minute OHLC candle aggregation
 
-- [ ] Bucket ticks by exact UTC minute boundaries.
-- [ ] Set the first tick as open and update high, low, and close correctly.
-- [ ] Track tick count and, if available, traded volume.
-- [ ] Finalize each candle exactly when its minute closes.
-- [ ] Prevent overlapping or duplicate candles.
-- [ ] Decide and document how minutes with no ticks are handled.
-- [ ] Decide and document how late or out-of-order ticks are handled.
-- [ ] Store the current candle and a bounded rolling history per symbol.
-- [ ] Notify API/WebSocket consumers whenever a candle changes or finalizes.
+- [x] Bucket ticks by exact UTC minute boundaries.
+- [x] Set the first tick as open and update high, low, and close correctly.
+- [x] Track tick count. Volume remains unset because ticker updates are not
+      equivalent to executed trade volume.
+- [x] Finalize each candle exactly when its minute closes.
+- [x] Prevent overlapping or duplicate candles.
+- [x] Skip empty minutes rather than fabricating candles without market data.
+- [x] Ignore ticks older than the current candle to protect finalized history.
+- [x] Store the current candle and a bounded rolling history per symbol.
+- [x] Notify API/WebSocket consumers whenever a candle changes or finalizes.
+
+The candle service uses O(1) dictionary access for the active candle and a
+bounded `deque` for finalized history. Each tick performs a constant amount of
+OHLC work. The minute-boundary sweep is O(s), where s is the number of active
+symbols and every active candle must be inspected once.
 
 ### Phase 5: REST and custom WebSocket API
 
@@ -195,13 +199,12 @@ Implementation notes:
 - [x] Add an endpoint listing active symbols.
 - [x] Add endpoints to add and remove symbols safely.
 - [x] Add an endpoint returning the latest tick for each symbol.
-- [ ] Add an endpoint returning current and historical candles.
-- [ ] Add endpoints returning signals, positions, and trade history.
+- [x] Add an endpoint returning current and historical candles.
+- [x] Add endpoints returning signals, positions, and trade history.
 - [x] Replace the placeholder dashboard response with real application state.
-- [ ] Add a custom WebSocket endpoint for live candle updates. A live tick
-      endpoint is available now at `/ws/ticks`; candle events belong to Phase 4.
+- [x] Add live candle messages to the custom `/ws/ticks` WebSocket endpoint.
 - [x] Remove disconnected WebSocket clients without interrupting ingestion.
-- [ ] Add request validation, useful HTTP errors, and basic API documentation.
+- [x] Add request validation, useful HTTP errors, and interactive API documentation.
 
 Proposed endpoints:
 
@@ -212,24 +215,44 @@ POST   /api/symbols
 DELETE /api/symbols/{symbol}
 GET    /api/ticks/latest
 GET    /api/candles/{symbol}
+GET    /api/chart-candles/{symbol}?interval={interval}
+GET    /api/order-book/{symbol}
+GET    /api/indicators/{symbol}
 GET    /api/signals
 GET    /api/positions
-GET    /api/trades
+GET    /api/orders
+POST   /api/orders?test={true|false}
+GET    /api/orders/open
+GET    /api/orders/status
+DELETE /api/orders
+DELETE /api/orders/open/{symbol}
+GET    /api/account
+GET    /api/pnl/{symbol}
+POST   /api/orders/{symbol}/{order_id}/square-off
+GET    /api/order-lists
+POST   /api/order-lists
+GET    /api/order-lists/status
+DELETE /api/order-lists
 GET    /api/dashboard
-WS     /ws/candles
+WS     /ws/ticks
 ```
+
+The implemented WebSocket path is `/ws/ticks`; it multiplexes tick batches,
+candle batches, and on-demand partial order-book snapshots over one connection.
+The browser sends `subscribe_depth` and `unsubscribe_depth` actions when a card
+is opened or closed.
 
 ### Phase 6: SMA/EMA strategy
 
-- [ ] Choose and document the exact signal rule.
-- [ ] Make the fast and slow lookback periods configurable.
-- [ ] Calculate indicators only from finalized candles.
-- [ ] Emit a BUY signal when the selected bullish crossover occurs.
-- [ ] Emit a SELL/EXIT signal when the selected bearish crossover occurs.
-- [ ] Avoid repeating the same signal on every candle.
-- [ ] Wait for enough candle history before evaluating the strategy.
-- [ ] Run the same entry/exit logic for both risk variants.
-- [ ] Store strategy decisions with input values for later debugging.
+- [x] Use SMA crossing EMA as the exact entry and exit rule.
+- [x] Make the fast and slow lookback periods configurable.
+- [x] Calculate strategy indicators only from finalized candles.
+- [x] Emit a BUY signal when fast SMA crosses above slow EMA.
+- [x] Emit an EXIT signal when fast SMA crosses below slow EMA.
+- [x] Emit only on relation changes rather than repeating every candle.
+- [x] Wait for the configured slow-period history before evaluating signals.
+- [x] Run identical signal logic for both risk variants.
+- [x] Store bounded signal and indicator histories with their input values.
 
 Initial suggested rule:
 
@@ -238,16 +261,30 @@ BUY:  fast SMA crosses above slow EMA
 EXIT: fast SMA crosses below slow EMA, or SL/TP is triggered
 ```
 
+The strategy keeps a rolling close sum, EMA accumulator, sample count, and
+previous SMA/EMA relation per symbol. Each finalized-candle update is expected
+O(1). Historical indicator and signal responses are O(requested records).
+
+The chart toolbar includes `1m`, `5m`, `15m`, `1H`, `4H`, and `1D` Binance
+candle views, a color-coded volume histogram, and an `SMA/EMA` toggle. Enabling it on the one-minute view loads
+the selected symbol's SMA/EMA history from `/api/indicators/{symbol}`
+and displays yellow SMA and purple EMA lines plus the current values and latest
+A/B crossover signal. Switching symbol tabs reloads the corresponding indicator
+series. The strategy indicators remain restricted to `1m` because the strategy
+evaluates finalized one-minute candles; other chart intervals disable the toggle
+to avoid presenting misleading values. The visual toggle does not stop strategy
+evaluation.
+
 ### Phase 7: Position and risk management
 
-- [ ] Maintain independent positions for Variant A and Variant B.
-- [ ] Record entry price, current price, quantity, and unrealized P&L.
-- [ ] Calculate stop-loss and take-profit levels at entry time.
-- [ ] Exit a position once its SL or TP condition is met.
-- [ ] Prevent duplicate positions unless explicitly permitted.
-- [ ] Define behavior when an order is rejected or only partially filled.
-- [ ] Reconcile local position state with Binance responses.
-- [ ] Add a global switch that disables all order placement.
+- [x] Maintain independent positions for Variant A and Variant B.
+- [x] Record entry price, current price, quantity, and unrealized P&L.
+- [x] Calculate stop-loss and take-profit levels at entry time.
+- [x] Exit a position once its SL or TP condition is met.
+- [x] Prevent duplicate and concurrent positions per symbol/variant.
+- [x] Open/close local state only for Binance-reported executed quantity.
+- [x] Provide signed query/open-order APIs for reconciliation.
+- [x] Keep the global order-placement switch disabled by default.
 
 Important assignment clarification: it labels a 15% stop loss as tighter and a
 10% stop loss as looser. Normally, 10% is tighter because the exit is closer to
@@ -256,25 +293,33 @@ B = 15%, while keeping both values configurable.
 
 ### Phase 8: Binance Testnet order execution
 
-- [ ] Implement authenticated Binance Testnet REST requests.
-- [ ] Confirm that the configured URLs point only to Testnet.
-- [ ] Fetch symbol filters such as minimum quantity, step size, and tick size.
-- [ ] Convert the configured dummy order size into a valid quantity.
-- [ ] Place small market or limit orders when valid signals occur.
-- [ ] Add request timeouts and bounded retries where safe.
-- [ ] Do not retry an uncertain order blindly; use client order IDs to prevent
+- [x] Implement HMAC-SHA256 authenticated Binance Demo REST requests.
+- [x] Allow only official Spot Testnet or Demo Mode order hosts.
+- [x] Fetch and cache symbol filters such as minimum quantity, step size, and tick size.
+- [x] Normalize configured quantities and prices to exchange filters.
+- [x] Support all seven current single Spot order types and automated MARKET signals.
+- [x] Add request timeouts and avoid unsafe order retries.
+- [x] Use deterministic strategy client order IDs to prevent
       duplicate orders.
-- [ ] Record request, response, rejection, and fill information.
-- [ ] Never log API secrets or signed request credentials.
+- [x] Record order responses and lifecycle updates in bounded memory.
+- [x] Never log API secrets, signatures, or signed request URLs.
+
+Supported single-order types are `MARKET`, `LIMIT`, `STOP_LOSS`,
+`STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`, and `LIMIT_MAKER`.
+Their type-specific required parameters, time-in-force values, stop/trailing
+triggers, iceberg constraints, pegging fields, and symbol filters are validated
+before signing. Binance order-list workflows (OCO, OPO/OPOCO, and OTO/OTOCO)
+use their distinct official endpoints through `/api/order-lists`; they are not
+misrepresented as single-order types.
 
 ### Phase 9: Trade logging and persistence
 
-- [ ] Maintain an in-memory trade log for API access.
-- [ ] Persist trades to a local database or append-only file.
-- [ ] Store timestamp, symbol, side, size, price, strategy variant, order ID,
+- [x] Maintain an in-memory trade log for API access.
+- [x] Persist trades and strategy positions to SQLite.
+- [x] Store timestamp, symbol, side, size, price, strategy variant, order ID,
       status, and exit reason.
-- [ ] Restore essential state after a restart or reconcile it with Binance.
-- [ ] Add filtering by symbol, variant, side, and time range.
+- [x] Restore local state after restart and reconcile account orders/fills with Binance.
+- [x] Add filtering by symbol, variant, side, status, and time range.
 
 ### Phase 10: JavaScript frontend
 
@@ -282,14 +327,15 @@ B = 15%, while keeping both values configurable.
 - [x] Show backend and Binance connection status.
 - [x] Show active symbols and controls for adding/removing them.
 - [x] Display the latest price and timestamp for each symbol.
-- [ ] Display recent one-minute OHLC candles.
-- [ ] Add candlestick or line charts.
-- [ ] Connect to the backend WebSocket for live candle updates. Live tick
-      streaming is connected; candle streaming will be added in Phase 4.
+- [x] Display recent one-minute OHLC candles.
+- [x] Add a TradingView Lightweight Charts candlestick chart that loads bounded
+      REST history once and applies live WebSocket candles with O(1) `update`.
+- [x] Connect to the backend WebSocket for live tick, candle, indicator, signal,
+      and on-demand depth updates.
 - [x] Automatically reconnect the frontend WebSocket after disconnection.
-- [ ] Display current strategy signals and indicator values.
-- [ ] Display Variant A and Variant B positions and P&L separately.
-- [ ] Display the trade log and execution status.
+- [x] Display current strategy signals and indicator values.
+- [x] Display Variant A and Variant B positions and P&L separately.
+- [x] Display Binance order history, execution status, FIFO P&L, and square-off controls.
 - [x] Show loading, empty, disconnected, and error states.
 - [x] Remove the hard-coded backend host by using same-origin API URLs and
       browser-safe configuration from `/api/config`.
@@ -313,30 +359,134 @@ Current complexity characteristics:
   the browser updates only changed cards on its next animation frame instead of
   rebuilding the complete price grid.
 
+Clicking a symbol card opens a responsive trading workspace with a selectable
+timeframe candlestick chart on the left and its on-demand 10-level partial order book on
+the right. The initial 120 finalized candles are seeded from Binance's public
+`/api/v3/klines` endpoint and served through our REST API. Subsequent current
+candle updates come from our own live aggregation pipeline. The chart uses
+TradingView Lightweight Charts 5.2.0 and includes the required TradingView
+attribution and link.
+
+While the trading workspace is open, the dashboard summary and roadmap are
+hidden to maximize chart space. Active symbols appear as tabs along the top;
+selecting another tab replaces the chart, OHLC values, and on-demand depth
+subscription without leaving the workspace. Bid and ask depth tables are shown
+side by side in the right panel.
+
+Hovering a depth level reveals Buy and Sell actions that prefill the Spot order
+ticket with that exact limit price. The ticket supports Market, Limit,
+Conditional, and Post-only entry modes. Its management panel lists open Binance
+orders with cancellation controls and independent strategy positions with a
+manual square-off action. Keyboard shortcuts are `B`/`S` for side, `L`/`M` for
+order type, `Ctrl+Enter` to submit, and `Esc` to reset; shortcuts never bypass
+the backend kill switch or exchange validation.
+
+Spot P&L is reconstructed from Binance's signed `myTrades` fill ledger using
+FIFO lots. Quote/base commissions are included directly, realized P&L is
+assigned to sell orders, and unrealized P&L is assigned to remaining buy lots
+at the current live price. Commissions paid in a third asset are disclosed
+separately rather than converted using an inaccurate present-day rate. Clicking
+Square off submits an immediate idempotent MARKET sell for that buy lot's
+remaining quantity.
+After the FIFO basis is loaded, unrealized totals and per-order values are
+recomputed on every selected-symbol Binance ticker update without polling the
+account API. The order ticket can be closed independently and reopened with the
+`Trade` button or any trading keyboard shortcut.
+
+If no active trading session exists, the first submit opens an inline Binance
+Demo credential prompt. The backend verifies the credentials with the signed
+account endpoint, retains them only as masked secret objects in process memory,
+and resumes the pending order after a successful connection. The browser fields
+are cleared immediately; credentials are never written to YAML, `.env`, browser
+storage, logs, or the order audit. Stopping the backend clears the session.
+The first order fetches only that symbol's exchange filters (cached afterward)
+rather than Binance's complete symbol catalogue. Backend and browser deadlines
+ensure a slow upstream request returns an actionable timeout instead of leaving
+the ticket indefinitely in a submitting state.
+
+```text
+GET    /api/order-session
+POST   /api/order-session
+DELETE /api/order-session
+```
+
+Binance depth snapshots continue arriving at up to 100 ms intervals. To prevent
+visual flicker, the browser keeps only the newest pending snapshot in O(1) and
+renders the depth tables at the configurable
+`order_book_render_interval_milliseconds` threshold (500 ms by default). This
+is a trailing-edge throttle: intermediate frames are skipped, but each rendered
+frame uses the latest data available at that moment.
+
 ### Phase 11: Testing
 
-- [ ] Unit-test tick parsing and UTC timestamp normalization.
-- [ ] Unit-test OHLC calculations and exact minute boundaries.
-- [ ] Test late ticks, missing minutes, duplicate ticks, and symbol separation.
-- [ ] Unit-test SMA/EMA calculations and crossover signals.
-- [ ] Unit-test SL, TP, position P&L, and duplicate-signal prevention.
-- [ ] Mock Binance WebSocket and REST responses for repeatable tests.
-- [ ] Test disconnect and reconnection behavior.
-- [ ] Test API success, validation, and failure responses.
-- [ ] Test frontend API and WebSocket error handling.
-- [ ] Run a controlled end-to-end test against Binance Testnet.
+- [x] Unit-test tick parsing and UTC timestamp normalization.
+- [x] Unit-test OHLC calculations and exact minute boundaries.
+- [x] Test late ticks, duplicate ticks, and symbol separation; empty minutes are intentionally skipped.
+- [x] Unit-test SMA/EMA calculations and crossover signals.
+- [x] Unit-test FIFO P&L, commissions, kill switch, and duplicate prevention paths.
+- [x] Mock Binance REST responses for deterministic order and P&L tests.
+- [x] Exercise reconnect/stale handling through bounded state-machine logic and manual disconnect tests.
+- [x] Test API payload validation and failure guards.
+- [x] Validate frontend syntax, timeout recovery, and WebSocket error branches.
+- [x] Run controlled end-to-end Demo Mode MARKET orders and verify Binance fills.
 
 ### Phase 12: Documentation and delivery
 
-- [ ] Document prerequisites and exact setup commands.
-- [ ] Document how to create Binance Testnet credentials.
-- [ ] Document configuration fields without exposing credentials.
-- [ ] Document the strategy, SL/TP calculations, and assumptions.
-- [ ] Document how to start the backend and frontend.
-- [ ] Provide example API requests and WebSocket messages.
-- [ ] Add screenshots or a short demo recording if required.
-- [ ] Document known limitations and future improvements.
-- [ ] Verify that no production Binance endpoint or real credential is used.
+- [x] Document prerequisites and exact setup commands.
+- [x] Document how to create and use Binance Demo credentials safely.
+- [x] Document configuration fields without exposing credentials.
+- [x] Document the strategy, SL/TP calculations, P&L, and assumptions.
+- [x] Document how to start the backend and frontend.
+- [x] Provide example API requests and WebSocket messages.
+- [x] Document known limitations and future improvements.
+- [x] Restrict signed order execution to official Binance Demo/Testnet hosts;
+      the production endpoint is used only for public read-only market data.
+
+## Demo credentials
+
+Create a new key from Binance Demo Trading's API Key Management page. Never use
+a production key and never paste a secret into source files. The recommended
+flow is to leave `.env` blank, prepare an order in the dashboard, and enter the
+Demo key in the runtime prompt. Successful verification enables trading only
+until the backend stops. Revoke any key disclosed in chat, screenshots, logs,
+or source control immediately.
+
+## API examples
+
+Create a validation-only market order (the request is signed but not matched):
+
+```powershell
+$body = @{ symbol = "BTCUSDT"; side = "BUY"; type = "MARKET"; quoteOrderQty = "10" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/api/orders?test=true" -ContentType "application/json" -Body $body
+```
+
+Filter order history and inspect FIFO P&L:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/api/orders?symbol=BTCUSDT&side=BUY&status=FILLED"
+Invoke-RestMethod "http://127.0.0.1:8000/api/pnl/BTCUSDT"
+```
+
+WebSocket clients connect to `ws://127.0.0.1:8000/ws/ticks` and can request
+depth with `{"action":"subscribe_depth","symbol":"BTCUSDT"}` or release it
+with the corresponding `unsubscribe_depth` action.
+
+Run the complete offline test suite:
+
+```powershell
+$env:PYTHONPATH = "backend"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+## Known limitations
+
+- This is a single-process educational Demo Mode system, not production trading
+  infrastructure or financial advice.
+- Runtime credentials intentionally disappear at backend shutdown.
+- Third-asset commissions are reported without historical USDT conversion.
+- SQLite stores audit/strategy state locally; Binance remains authoritative for
+  balances, fills, open orders, and order lists.
+- The chart library loads from a public CDN and therefore needs internet access.
 
 ## Suggested implementation order
 

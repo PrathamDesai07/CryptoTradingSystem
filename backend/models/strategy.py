@@ -30,6 +30,20 @@ class Signal(BaseModel):
     reason: str
 
 
+class IndicatorPoint(BaseModel):
+    """SMA/EMA values calculated from one finalized candle."""
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: Symbol
+    timestamp: UtcDateTime
+    close: PositiveDecimal
+    sma: PositiveDecimal | None
+    ema: PositiveDecimal | None
+    fast_period: int
+    slow_period: int
+
+
 class Position(BaseModel):
     """The independently tracked state of one strategy position."""
 

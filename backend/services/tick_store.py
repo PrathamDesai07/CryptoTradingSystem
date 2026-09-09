@@ -16,8 +16,11 @@ class TickStore:
         """Store a tick unless a newer tick for the symbol already exists."""
         async with self._lock:
             existing = self._ticks.get(tick.symbol)
-            if existing is not None and existing.timestamp > tick.timestamp:
-                return False
+            if existing is not None:
+                if existing.timestamp > tick.timestamp:
+                    return False
+                if existing == tick:
+                    return False
             self._ticks[tick.symbol] = tick
             return True
 

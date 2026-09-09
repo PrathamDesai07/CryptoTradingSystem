@@ -1,1 +1,581 @@
-"""Binance Testnet order placement will live here."""
+"""Signed Binance Spot Demo orders and independent strategy position risk."""
+
+import asyncio
+from collections import deque
+from datetime import UTC, datetime
+from decimal import Decimal, ROUND_DOWN
+import hashlib
+import hmac
+import json
+import logging
+from time import monotonic, time
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from pydantic import SecretStr
+
+from config import Settings
+from models import ExitReason, Position, PositionStatus, Signal, SignalAction, StrategyVariant, Tick
+from services.state_repository import StateRepository
+
+logger = logging.getLogger(__name__)
+
+
+class BinanceOrderError(RuntimeError):
+    """A credential-free Binance API error safe to return to clients."""
+
+    def __init__(self, message: str, status_code: int = 502, code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+
+
+class OrderService:
+    """Manage Spot orders and O(1) position lookup by symbol and variant."""
+
+    ORDER_TYPES = frozenset({"MARKET", "LIMIT", "STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "LIMIT_MAKER"})
+    TIME_IN_FORCE = frozenset({"GTC", "IOC", "FOK"})
+    ORDER_LIST_PATHS = {
+        "OCO": "/api/v3/orderList/oco",
+        "OTO": "/api/v3/orderList/oto",
+        "OTOCO": "/api/v3/orderList/otoco",
+        "OPO": "/api/v3/orderList/opo",
+        "OPOCO": "/api/v3/orderList/opoco",
+    }
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._positions: dict[tuple[str, StrategyVariant], Position] = {}
+        self._orders: dict[str, dict[str, Any]] = {}
+        self._history: deque[dict[str, Any]] = deque(maxlen=settings.strategy_signal_history_size)
+        self._symbol_rules: dict[str, dict[str, Any]] = {}
+        self._exchange_info_loaded_at: dict[str, float] = {}
+        self._lock = asyncio.Lock()
+        self._inflight: set[tuple[str, StrategyVariant]] = set()
+        self._runtime_api_key: SecretStr | None = None
+        self._runtime_api_secret: SecretStr | None = None
+        self._session_execution_enabled = False
+        self._squared_orders: set[tuple[str, int]] = set()
+        self._repository = StateRepository(settings.state_database_path, settings.strategy_signal_history_size)
+        for record in self._repository.load_orders():
+            self._history.append(record)
+            client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
+            if client_id:
+                self._orders[client_id] = record
+        for position in self._repository.load_positions():
+            self._positions[(position.symbol, position.variant)] = position
+
+    @property
+    def execution_enabled(self) -> bool:
+        return self._settings.order_execution_enabled or self._session_execution_enabled
+
+    @property
+    def credentials_configured(self) -> bool:
+        return bool(self._api_key() and self._api_secret())
+
+    @property
+    def runtime_session_active(self) -> bool:
+        return bool(self._runtime_api_key and self._runtime_api_secret and self._session_execution_enabled)
+
+    async def connect_credentials(self, api_key: str, api_secret: str) -> dict[str, Any]:
+        """Validate and retain credentials only for this backend process."""
+        if not api_key.strip() or not api_secret.strip():
+            raise BinanceOrderError("API key and secret are required", 422)
+        previous_key, previous_secret = self._runtime_api_key, self._runtime_api_secret
+        self._runtime_api_key = SecretStr(api_key.strip())
+        self._runtime_api_secret = SecretStr(api_secret.strip())
+        try:
+            account = await self.account()
+        except Exception:
+            self._runtime_api_key, self._runtime_api_secret = previous_key, previous_secret
+            raise
+        if not account.get("canTrade"):
+            self._runtime_api_key, self._runtime_api_secret = previous_key, previous_secret
+            raise BinanceOrderError("these Binance Demo credentials are not permitted to trade", 403)
+        self._session_execution_enabled = True
+        return {
+            "account_type": account.get("accountType"),
+            "can_trade": bool(account.get("canTrade")),
+        }
+
+    def clear_credentials(self) -> None:
+        self._runtime_api_key = None
+        self._runtime_api_secret = None
+        self._session_execution_enabled = False
+
+    async def positions(self, symbol: str | None = None) -> tuple[Position, ...]:
+        async with self._lock:
+            return tuple(p.model_copy(deep=True) for (s, _), p in self._positions.items() if symbol is None or s == symbol)
+
+    async def orders(self, symbol: str | None = None, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        async with self._lock:
+            selected = [item.copy() for item in self._history if symbol is None or item.get("symbol") == symbol]
+            return tuple(selected[-limit:])
+
+    async def process_signal(self, signal: Signal) -> None:
+        if not self.execution_enabled:
+            return
+        key = (signal.symbol, signal.variant)
+        async with self._lock:
+            position = self._positions.get(key)
+            if key in self._inflight:
+                return
+            if signal.action is SignalAction.BUY and position and position.status is PositionStatus.OPEN:
+                return
+            if signal.action is SignalAction.EXIT and (not position or position.status is not PositionStatus.OPEN):
+                return
+            self._inflight.add(key)
+        try:
+            if signal.action is SignalAction.BUY:
+                await self._enter(signal)
+            else:
+                await self._exit(key, signal.price, signal.timestamp, ExitReason.SIGNAL)
+        except BinanceOrderError:
+            logger.exception("strategy_order_failed symbol=%s variant=%s", signal.symbol, signal.variant)
+        finally:
+            async with self._lock:
+                self._inflight.discard(key)
+
+    async def process_tick(self, tick: Tick) -> None:
+        exits: list[tuple[tuple[str, StrategyVariant], ExitReason]] = []
+        async with self._lock:
+            for variant in StrategyVariant:
+                key = (tick.symbol, variant)
+                position = self._positions.get(key)
+                if not position or position.status is not PositionStatus.OPEN:
+                    continue
+                position.current_price = tick.price
+                position.current_pnl = (tick.price - position.entry_price) * position.quantity
+                if self.execution_enabled and key not in self._inflight:
+                    reason = ExitReason.STOP_LOSS if tick.price <= position.stop_loss_price else ExitReason.TAKE_PROFIT if tick.price >= position.take_profit_price else None
+                    if reason:
+                        self._inflight.add(key)
+                        exits.append((key, reason))
+        for key, reason in exits:
+            asyncio.create_task(
+                self._execute_risk_exit(key, tick.price, tick.timestamp, reason),
+                name=f"risk-exit-{key[0]}-{key[1].value}",
+            )
+
+    async def _execute_risk_exit(self, key: tuple[str, StrategyVariant], price: Decimal, timestamp: datetime, reason: ExitReason) -> None:
+        try:
+            await self._exit(key, price, timestamp, reason)
+        except BinanceOrderError:
+            logger.exception("risk_exit_failed symbol=%s variant=%s", *key)
+        finally:
+            async with self._lock:
+                self._inflight.discard(key)
+
+    async def place_order(self, params: dict[str, Any], test: bool = False) -> dict[str, Any]:
+        if not test and not self.execution_enabled:
+            raise BinanceOrderError("order execution is disabled by the global kill switch", 409)
+        normalized = await self._normalize_order(params)
+        response = await self._signed_request("POST", "/api/v3/order/test" if test else "/api/v3/order", normalized)
+        if not test:
+            await self._record(response, normalized)
+        return response
+
+    async def query_order(self, symbol: str, order_id: int | None, client_id: str | None) -> dict[str, Any]:
+        params = self._order_reference(symbol, order_id, client_id)
+        response = await self._signed_request("GET", "/api/v3/order", params)
+        await self._record(response, params)
+        return response
+
+    async def cancel_order(self, symbol: str, order_id: int | None, client_id: str | None) -> dict[str, Any]:
+        params = self._order_reference(symbol, order_id, client_id)
+        response = await self._signed_request("DELETE", "/api/v3/order", params)
+        await self._record(response, params)
+        return response
+
+    async def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        response = await self._signed_request("GET", "/api/v3/openOrders", {} if symbol is None else {"symbol": symbol})
+        return response if isinstance(response, list) else []
+
+    async def account_orders(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
+        response = await self._signed_request("GET", "/api/v3/allOrders", {"symbol": symbol, "limit": limit})
+        return response if isinstance(response, list) else []
+
+    async def place_order_list(self, kind: str, params: dict[str, Any]) -> dict[str, Any]:
+        if not self.execution_enabled:
+            raise BinanceOrderError("order execution is disabled by the global kill switch", 409)
+        normalized_kind = kind.upper()
+        path = self.ORDER_LIST_PATHS.get(normalized_kind)
+        if path is None:
+            raise BinanceOrderError("order-list type must be OCO, OTO, OTOCO, OPO, or OPOCO", 422)
+        clean = {key: value for key, value in params.items() if key not in {"signature", "timestamp", "recvWindow"} and value is not None}
+        symbol = str(clean.get("symbol", "")).strip().upper()
+        if not symbol.isalnum():
+            raise BinanceOrderError("a valid symbol is required", 422)
+        clean["symbol"] = symbol
+        response = await self._signed_request("POST", path, clean)
+        for report in response.get("orderReports", []):
+            if isinstance(report, dict):
+                await self._record(report, {"symbol": symbol, "orderListType": normalized_kind})
+        return response
+
+    async def query_order_list(self, order_list_id: int | None, client_id: str | None) -> dict[str, Any]:
+        if order_list_id is None and not client_id:
+            raise BinanceOrderError("orderListId or origClientOrderId is required", 422)
+        params = {"orderListId": order_list_id} if order_list_id is not None else {"origClientOrderId": client_id}
+        return await self._signed_request("GET", "/api/v3/orderList", params)
+
+    async def cancel_order_list(self, symbol: str, order_list_id: int | None, client_id: str | None) -> dict[str, Any]:
+        if order_list_id is None and not client_id:
+            raise BinanceOrderError("orderListId or listClientOrderId is required", 422)
+        params: dict[str, Any] = {"symbol": symbol}
+        params.update({"orderListId": order_list_id} if order_list_id is not None else {"listClientOrderId": client_id})
+        return await self._signed_request("DELETE", "/api/v3/orderList", params)
+
+    async def order_lists(self, open_only: bool = True) -> list[dict[str, Any]]:
+        path = "/api/v3/openOrderList" if open_only else "/api/v3/allOrderList"
+        response = await self._signed_request("GET", path, {})
+        return response if isinstance(response, list) else []
+
+    async def cancel_all(self, symbol: str) -> list[dict[str, Any]]:
+        response = await self._signed_request("DELETE", "/api/v3/openOrders", {"symbol": symbol})
+        for item in response if isinstance(response, list) else []:
+            if isinstance(item, dict):
+                await self._record(item, {"symbol": symbol})
+        return response if isinstance(response, list) else []
+
+    async def account(self) -> dict[str, Any]:
+        response = await self._signed_request("GET", "/api/v3/account", {"omitZeroBalances": "true"})
+        return response if isinstance(response, dict) else {}
+
+    async def pnl(self, symbol: str, current_price: Decimal) -> dict[str, Any]:
+        """Build FIFO realized/unrealized P&L from authoritative Binance fills."""
+        trades = await self._all_trades(symbol)
+        rules = await self._rules(symbol)
+        base_asset = rules.get("_baseAsset", symbol.removesuffix("USDT"))
+        quote_asset = rules.get("_quoteAsset", "USDT")
+        lots: deque[dict[str, Any]] = deque()
+        realized_by_order: dict[int, Decimal] = {}
+        fees_other: dict[str, Decimal] = {}
+        for trade in sorted(trades, key=lambda item: (int(item.get("time", 0)), int(item.get("id", 0)))):
+            quantity = Decimal(str(trade["qty"]))
+            quote = Decimal(str(trade["quoteQty"]))
+            commission = Decimal(str(trade.get("commission", "0")))
+            commission_asset = str(trade.get("commissionAsset", ""))
+            order_id = int(trade["orderId"])
+            if commission_asset not in {base_asset, quote_asset} and commission:
+                fees_other[commission_asset] = fees_other.get(commission_asset, Decimal(0)) + commission
+            if trade.get("isBuyer"):
+                net_quantity = quantity - commission if commission_asset == base_asset else quantity
+                cost = quote + commission if commission_asset == quote_asset else quote
+                if net_quantity > 0:
+                    lots.append({"order_id": order_id, "quantity": net_quantity, "cost": cost})
+                continue
+            disposed = quantity + commission if commission_asset == base_asset else quantity
+            proceeds = quote - commission if commission_asset == quote_asset else quote
+            remaining = disposed
+            matched_cost = Decimal(0)
+            matched_quantity = Decimal(0)
+            while remaining > 0 and lots:
+                lot = lots[0]
+                used = min(remaining, lot["quantity"])
+                unit_cost = lot["cost"] / lot["quantity"]
+                matched_cost += unit_cost * used
+                matched_quantity += used
+                lot["quantity"] -= used
+                lot["cost"] -= unit_cost * used
+                remaining -= used
+                if lot["quantity"] <= 0:
+                    lots.popleft()
+            if matched_quantity > 0:
+                matched_proceeds = proceeds * (matched_quantity / disposed)
+                realized_by_order[order_id] = realized_by_order.get(order_id, Decimal(0)) + matched_proceeds - matched_cost
+
+        unrealized_by_order: dict[int, Decimal] = {}
+        remaining_by_order: dict[int, Decimal] = {}
+        open_quantity = Decimal(0)
+        open_cost = Decimal(0)
+        for lot in lots:
+            open_quantity += lot["quantity"]
+            open_cost += lot["cost"]
+            unrealized_by_order[lot["order_id"]] = unrealized_by_order.get(lot["order_id"], Decimal(0)) + current_price * lot["quantity"] - lot["cost"]
+            remaining_by_order[lot["order_id"]] = remaining_by_order.get(lot["order_id"], Decimal(0)) + lot["quantity"]
+        order_ids = set(realized_by_order) | set(unrealized_by_order)
+        return {
+            "symbol": symbol,
+            "method": "FIFO",
+            "current_price": current_price,
+            "open_quantity": open_quantity,
+            "open_cost": open_cost,
+            "market_value": open_quantity * current_price,
+            "realized_pnl": sum(realized_by_order.values(), Decimal(0)),
+            "unrealized_pnl": open_quantity * current_price - open_cost,
+            "total_pnl": sum(realized_by_order.values(), Decimal(0)) + open_quantity * current_price - open_cost,
+            "orders": [
+                {"order_id": order_id, "realized_pnl": realized_by_order.get(order_id), "unrealized_pnl": unrealized_by_order.get(order_id), "remaining_quantity": remaining_by_order.get(order_id, Decimal(0))}
+                for order_id in sorted(order_ids)
+            ],
+            "unconverted_commissions": fees_other,
+        }
+
+    async def _all_trades(self, symbol: str) -> list[dict[str, Any]]:
+        """Page the complete fill history without the former 1,000-fill truncation."""
+        collected: list[dict[str, Any]] = []
+        from_id: int | None = None
+        while True:
+            params: dict[str, Any] = {"symbol": symbol, "limit": 1000}
+            if from_id is not None:
+                params["fromId"] = from_id
+            page = await self._signed_request("GET", "/api/v3/myTrades", params)
+            if not isinstance(page, list) or not page:
+                break
+            collected.extend(page)
+            if len(page) < 1000:
+                break
+            next_id = int(page[-1]["id"]) + 1
+            if from_id is not None and next_id <= from_id:
+                break
+            from_id = next_id
+        return collected
+
+    async def square_off_order(self, symbol: str, order_id: int) -> dict[str, Any]:
+        """Immediately market-sell the executed quantity of one filled buy once."""
+        key = (symbol, order_id)
+        pnl_state = await self.pnl(symbol, Decimal(0))
+        pnl_order = next((item for item in pnl_state["orders"] if item["order_id"] == order_id), None)
+        remaining_quantity = Decimal(0) if pnl_order is None else Decimal(pnl_order["remaining_quantity"])
+        async with self._lock:
+            matches = [item for item in self._history if item.get("symbol") == symbol and int(item.get("orderId", -1)) == order_id]
+            source = matches[-1] if matches else None
+        if source is None:
+            source = await self.query_order(symbol, order_id, None)
+        async with self._lock:
+            if key in self._squared_orders:
+                raise BinanceOrderError("this order has already been squared off", 409)
+            if not source or source.get("side") != "BUY" or source.get("status") != "FILLED":
+                raise BinanceOrderError("only a filled buy order can be squared off", 422)
+            if remaining_quantity <= 0:
+                raise BinanceOrderError("this buy order has no remaining quantity to square off", 409)
+            self._squared_orders.add(key)
+        try:
+            return await self.place_order({
+                "symbol": symbol,
+                "side": "SELL",
+                "type": "MARKET",
+                "quantity": str(remaining_quantity),
+                "newClientOrderId": f"ctsSQ{order_id}"[:36],
+                "newOrderRespType": "FULL",
+            })
+        except Exception:
+            async with self._lock:
+                self._squared_orders.discard(key)
+            raise
+
+    async def square_off(self, symbol: str, variant: StrategyVariant) -> None:
+        if not self.execution_enabled:
+            raise BinanceOrderError("order execution is disabled by the global kill switch", 409)
+        key = (symbol, variant)
+        async with self._lock:
+            position = self._positions.get(key)
+            if not position or position.status is not PositionStatus.OPEN:
+                raise BinanceOrderError("no open position exists for this symbol and variant", 404)
+            if key in self._inflight:
+                raise BinanceOrderError("a position order is already in flight", 409)
+            self._inflight.add(key)
+            price = position.current_price
+        try:
+            await self._exit(key, price, datetime.now(UTC), ExitReason.MANUAL)
+        finally:
+            async with self._lock:
+                self._inflight.discard(key)
+
+    async def _enter(self, signal: Signal) -> None:
+        response = await self.place_order({"symbol": signal.symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": str(self._settings.order_size_usdt), "newClientOrderId": self._client_id(signal, "B"), "newOrderRespType": "FULL"})
+        quantity, price = self._execution(response, signal.price)
+        if quantity <= 0:
+            return
+        stop = self._settings.variant_a_stop_loss_percent if signal.variant is StrategyVariant.A else self._settings.variant_b_stop_loss_percent
+        position = Position(symbol=signal.symbol, variant=signal.variant, status=PositionStatus.OPEN, quantity=quantity, entry_price=price, current_price=price, current_pnl=Decimal(0), stop_loss_price=price * (Decimal(1) - Decimal(str(stop)) / 100), take_profit_price=price * (Decimal(1) + Decimal(str(self._settings.take_profit_percent)) / 100), opened_at=signal.timestamp)
+        async with self._lock:
+            self._positions[(signal.symbol, signal.variant)] = position
+            self._repository.save_position(position)
+
+    async def _exit(self, key: tuple[str, StrategyVariant], fallback: Decimal, timestamp: datetime, reason: ExitReason) -> None:
+        async with self._lock:
+            position = self._positions.get(key)
+            if not position or position.status is not PositionStatus.OPEN:
+                return
+            quantity = position.quantity
+        response = await self.place_order({"symbol": key[0], "side": "SELL", "type": "MARKET", "quantity": str(quantity), "newClientOrderId": f"cts{key[1].value}{key[0]}S{int(timestamp.timestamp())}"[:36], "newOrderRespType": "FULL"})
+        executed, price = self._execution(response, fallback)
+        if executed <= 0:
+            return
+        async with self._lock:
+            position = self._positions.get(key)
+            if position:
+                remaining = max(Decimal(0), position.quantity - executed)
+                updated = position.model_dump()
+                updated.update(
+                    current_price=price,
+                    current_pnl=(price - position.entry_price) * executed,
+                    quantity=remaining if remaining > 0 else position.quantity,
+                    status=PositionStatus.OPEN if remaining > 0 else PositionStatus.CLOSED,
+                    closed_at=None if remaining > 0 else timestamp,
+                )
+                self._positions[key] = Position.model_validate(updated)
+                self._repository.save_position(self._positions[key])
+            if self._history:
+                self._history[-1].update(exit_reason=reason.value, strategy_variant=key[1].value)
+
+    async def _normalize_order(self, params: dict[str, Any]) -> dict[str, str]:
+        result = {key: str(value) for key, value in params.items() if value is not None}
+        result["symbol"] = result.get("symbol", "").strip().upper()
+        result["side"] = result.get("side", "").upper()
+        result["type"] = result.get("type", "").upper()
+        if not result["symbol"].isalnum() or result["side"] not in {"BUY", "SELL"} or result["type"] not in self.ORDER_TYPES:
+            raise BinanceOrderError("invalid symbol, side, or Spot order type", 422)
+        self._validate_required(result)
+        rules = await self._rules(result["symbol"])
+        market_lot = rules.get("MARKET_LOT_SIZE", {})
+        quantity_filter = (
+            "MARKET_LOT_SIZE"
+            if result["type"] == "MARKET" and market_lot.get("stepSize") not in {None, "0.00000000"}
+            else "LOT_SIZE"
+        )
+        for field, filter_name in (("quantity", quantity_filter), ("icebergQty", "LOT_SIZE")):
+            if field in result:
+                result[field] = self._floor(result[field], rules.get(filter_name, {}).get("stepSize"))
+        for field in ("price", "stopPrice"):
+            if field in result:
+                result[field] = self._floor(result[field], rules.get("PRICE_FILTER", {}).get("tickSize"))
+        self._validate_filters(result, rules)
+        return result
+
+    def _validate_required(self, params: dict[str, str]) -> None:
+        order_type = params["type"]
+        required = {"LIMIT": {"timeInForce", "quantity", "price"}, "STOP_LOSS_LIMIT": {"timeInForce", "quantity", "price"}, "TAKE_PROFIT_LIMIT": {"timeInForce", "quantity", "price"}, "LIMIT_MAKER": {"quantity", "price"}, "STOP_LOSS": {"quantity"}, "TAKE_PROFIT": {"quantity"}}.get(order_type, set())
+        missing = required - params.keys()
+        if missing:
+            raise BinanceOrderError(f"missing required parameters: {', '.join(sorted(missing))}", 422)
+        if order_type == "MARKET" and ("quantity" in params) == ("quoteOrderQty" in params):
+            raise BinanceOrderError("MARKET requires exactly one of quantity or quoteOrderQty", 422)
+        if order_type in {"STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"} and "stopPrice" not in params and "trailingDelta" not in params:
+            raise BinanceOrderError("stop order requires stopPrice or trailingDelta", 422)
+        if "timeInForce" in params and params["timeInForce"] not in self.TIME_IN_FORCE:
+            raise BinanceOrderError("timeInForce must be GTC, IOC, or FOK", 422)
+        if "icebergQty" in params and params.get("timeInForce") != "GTC":
+            raise BinanceOrderError("iceberg orders require GTC", 422)
+
+    def _validate_filters(self, params: dict[str, str], rules: dict[str, Any]) -> None:
+        if "quantity" in params:
+            quantity, lot = Decimal(params["quantity"]), rules.get("LOT_SIZE", {})
+            if quantity <= 0 or quantity < Decimal(lot.get("minQty", "0")):
+                raise BinanceOrderError("quantity is below the symbol minimum", 422)
+            maximum = Decimal(lot.get("maxQty", "0"))
+            if maximum and quantity > maximum:
+                raise BinanceOrderError("quantity exceeds the symbol maximum", 422)
+        if "price" in params:
+            price, rule = Decimal(params["price"]), rules.get("PRICE_FILTER", {})
+            if price <= 0 or price < Decimal(rule.get("minPrice", "0")):
+                raise BinanceOrderError("price is below the symbol minimum", 422)
+        notional = rules.get("NOTIONAL") or rules.get("MIN_NOTIONAL") or {}
+        if "quantity" in params and "price" in params and Decimal(params["quantity"]) * Decimal(params["price"]) < Decimal(notional.get("minNotional", "0")):
+            raise BinanceOrderError("order notional is below the symbol minimum", 422)
+
+    async def _rules(self, symbol: str) -> dict[str, Any]:
+        loaded_at = self._exchange_info_loaded_at.get(symbol, 0.0)
+        if monotonic() - loaded_at >= self._settings.exchange_info_cache_seconds:
+            payload = await self._public_request("GET", "/api/v3/exchangeInfo", {"symbol": symbol})
+            items = payload.get("symbols", [])
+            if items:
+                item = items[0]
+                self._symbol_rules[symbol] = {
+                    entry["filterType"]: entry for entry in item.get("filters", [])
+                }
+                self._symbol_rules[symbol]["_baseAsset"] = item.get("baseAsset")
+                self._symbol_rules[symbol]["_quoteAsset"] = item.get("quoteAsset")
+                self._exchange_info_loaded_at[symbol] = monotonic()
+        if symbol not in self._symbol_rules:
+            raise BinanceOrderError("symbol is not available on Binance Demo Mode", 422)
+        return self._symbol_rules[symbol]
+
+    async def _record(self, response: dict[str, Any], request_params: dict[str, Any]) -> None:
+        record = {**request_params, **response, "recordedAt": datetime.now(UTC).isoformat()}
+        client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
+        async with self._lock:
+            if client_id:
+                self._orders[client_id] = record
+            self._history.append(record)
+            self._repository.save_order(record)
+
+    async def _signed_request(self, method: str, path: str, params: dict[str, Any]) -> Any:
+        api_key, secret = self._api_key(), self._api_secret()
+        if not api_key or not secret:
+            raise BinanceOrderError("Binance Demo API credentials are not configured", 503)
+        signed = {**params, "recvWindow": self._settings.order_recv_window_milliseconds, "timestamp": int(time() * 1000)}
+        query = urlencode(signed)
+        signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        return await self._request(method, path, f"{query}&signature={signature}", api_key)
+
+    async def _public_request(self, method: str, path: str, params: dict[str, Any]) -> Any:
+        return await self._request(method, path, urlencode(params), None)
+
+    async def _request(self, method: str, path: str, query: str, api_key: str | None) -> Any:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._request_sync, method, path, query, api_key),
+                timeout=self._settings.order_request_timeout_seconds + 1,
+            )
+        except TimeoutError as error:
+            raise BinanceOrderError(
+                "Binance did not respond in time; check order status before retrying"
+            ) from error
+
+    def _request_sync(self, method: str, path: str, query: str, api_key: str | None) -> Any:
+        url = f"{self._settings.binance_testnet_rest_url}{path}"
+        data = query.encode() if method in {"POST", "PUT"} else None
+        if method not in {"POST", "PUT"} and query:
+            url = f"{url}?{query}"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if api_key:
+            headers["X-MBX-APIKEY"] = api_key
+        try:
+            with urlopen(Request(url, data=data, headers=headers, method=method), timeout=self._settings.order_request_timeout_seconds) as response:  # noqa: S310
+                body = response.read()
+                return json.loads(body) if body else {}
+        except HTTPError as error:
+            try:
+                payload = json.loads(error.read())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = {}
+            raise BinanceOrderError(str(payload.get("msg", "Binance rejected the request")), error.code, payload.get("code")) from error
+        except (URLError, TimeoutError) as error:
+            raise BinanceOrderError("Binance request failed; reconcile by client order ID before retrying") from error
+
+    def _api_key(self) -> str:
+        value = self._runtime_api_key or self._settings.binance_api_key
+        return "" if value is None else value.get_secret_value()
+
+    def _api_secret(self) -> str:
+        value = self._runtime_api_secret or self._settings.binance_api_secret
+        return "" if value is None else value.get_secret_value()
+
+    @staticmethod
+    def _floor(value: str, increment: str | None) -> str:
+        number = Decimal(value)
+        if not increment or Decimal(increment) == 0:
+            return format(number, "f")
+        step = Decimal(increment)
+        return format((number / step).to_integral_value(rounding=ROUND_DOWN) * step, "f")
+
+    @staticmethod
+    def _execution(response: dict[str, Any], fallback: Decimal) -> tuple[Decimal, Decimal]:
+        quantity = Decimal(str(response.get("executedQty", "0")))
+        quote = Decimal(str(response.get("cummulativeQuoteQty", "0")))
+        return quantity, quote / quantity if quantity > 0 and quote > 0 else fallback
+
+    @staticmethod
+    def _order_reference(symbol: str, order_id: int | None, client_id: str | None) -> dict[str, Any]:
+        if order_id is None and not client_id:
+            raise BinanceOrderError("orderId or clientOrderId is required", 422)
+        return {"symbol": symbol, **({"orderId": order_id} if order_id is not None else {"origClientOrderId": client_id})}
+
+    @staticmethod
+    def _client_id(signal: Signal, suffix: str) -> str:
+        return f"cts{signal.variant.value}{signal.symbol}{suffix}{int(signal.timestamp.timestamp())}"[:36]

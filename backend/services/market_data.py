@@ -16,13 +16,15 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
 from config import Settings
-from models import Tick
+from models import OrderBookLevel, PartialOrderBook, Tick
 from models.common import normalize_symbol
+from services.order_book_store import OrderBookStore
 from services.tick_store import TickStore
 
 logger = logging.getLogger(__name__)
 
 TickHandler = Callable[[Tick], None | Awaitable[None]]
+OrderBookHandler = Callable[[PartialOrderBook], None | Awaitable[None]]
 
 
 class ServerShutdownError(ConnectionError):
@@ -37,11 +39,16 @@ class BinanceStreamClient:
         settings: Settings,
         tick_store: TickStore,
         on_tick: TickHandler | None = None,
+        order_book_store: OrderBookStore | None = None,
+        on_order_book: OrderBookHandler | None = None,
     ) -> None:
         self._settings = settings
         self._tick_store = tick_store
         self._on_tick = on_tick
+        self._order_book_store = order_book_store
+        self._on_order_book = on_order_book
         self._symbols = set(settings.symbols)
+        self._depth_symbols: set[str] = set()
         self._symbols_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
@@ -90,11 +97,11 @@ class BinanceStreamClient:
         async with self._symbols_lock:
             if normalized in self._symbols:
                 return False
-            if len(self._symbols) >= self._settings.websocket_max_streams:
+            if len(self._symbols) + len(self._depth_symbols) >= self._settings.websocket_max_streams:
                 raise ValueError("maximum Binance stream subscription count reached")
             self._symbols.add(normalized)
         try:
-            await self._send_subscription("SUBSCRIBE", [normalized])
+            await self._send_streams("SUBSCRIBE", [self._ticker_stream(normalized)])
         except Exception:
             async with self._symbols_lock:
                 self._symbols.discard(normalized)
@@ -107,13 +114,56 @@ class BinanceStreamClient:
             if normalized not in self._symbols:
                 return False
             self._symbols.remove(normalized)
+            had_depth = normalized in self._depth_symbols
+            self._depth_symbols.discard(normalized)
+        streams = [self._ticker_stream(normalized)]
+        if had_depth:
+            streams.append(self._depth_stream(normalized))
         try:
-            await self._send_subscription("UNSUBSCRIBE", [normalized])
+            await self._send_streams("UNSUBSCRIBE", streams)
         except Exception:
             async with self._symbols_lock:
                 self._symbols.add(normalized)
+                if had_depth:
+                    self._depth_symbols.add(normalized)
             raise
         await self._tick_store.remove(normalized)
+        if self._order_book_store is not None:
+            await self._order_book_store.remove(normalized)
+        return True
+
+    async def add_depth_symbol(self, symbol: str) -> bool:
+        normalized = normalize_symbol(symbol)
+        async with self._symbols_lock:
+            if normalized not in self._symbols:
+                raise ValueError("symbol must be active before subscribing to depth")
+            if normalized in self._depth_symbols:
+                return False
+            if len(self._symbols) + len(self._depth_symbols) >= self._settings.websocket_max_streams:
+                raise ValueError("maximum Binance stream subscription count reached")
+            self._depth_symbols.add(normalized)
+        try:
+            await self._send_streams("SUBSCRIBE", [self._depth_stream(normalized)])
+        except Exception:
+            async with self._symbols_lock:
+                self._depth_symbols.discard(normalized)
+            raise
+        return True
+
+    async def remove_depth_symbol(self, symbol: str) -> bool:
+        normalized = normalize_symbol(symbol)
+        async with self._symbols_lock:
+            if normalized not in self._depth_symbols:
+                return False
+            self._depth_symbols.remove(normalized)
+        try:
+            await self._send_streams("UNSUBSCRIBE", [self._depth_stream(normalized)])
+        except Exception:
+            async with self._symbols_lock:
+                self._depth_symbols.add(normalized)
+            raise
+        if self._order_book_store is not None:
+            await self._order_book_store.remove(normalized)
         return True
 
     async def _run(self) -> None:
@@ -169,7 +219,11 @@ class BinanceStreamClient:
 
             symbols = list(await self.active_symbols())
             if symbols:
-                await self._send_subscription("SUBSCRIBE", symbols)
+                async with self._symbols_lock:
+                    depth_symbols = tuple(self._depth_symbols)
+                streams = [self._ticker_stream(symbol) for symbol in symbols]
+                streams.extend(self._depth_stream(symbol) for symbol in depth_symbols)
+                await self._send_streams("SUBSCRIBE", streams)
 
             while not self._stop_event.is_set():
                 try:
@@ -197,12 +251,32 @@ class BinanceStreamClient:
                 logger.warning("binance_subscription_response payload=%s", payload)
             return
 
+        stream_name = payload.get("stream")
         event = payload.get("data", payload)
         if not isinstance(event, dict):
             logger.warning("binance_stream_invalid_event")
             return
         if event.get("e") == "serverShutdown":
             raise ServerShutdownError("Binance announced stream server shutdown")
+
+        if isinstance(stream_name, str) and "@depth" in stream_name:
+            try:
+                book = self._parse_order_book(event, stream_name)
+            except (KeyError, TypeError, ValueError, ArithmeticError, ValidationError):
+                logger.warning("binance_depth_event_rejected payload=%s", event)
+                return
+            if self._order_book_store is not None:
+                if not await self._order_book_store.update(book):
+                    return
+            if self._on_order_book is not None:
+                try:
+                    result = self._on_order_book(book)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.exception("order_book_handler_failed symbol=%s", book.symbol)
+            return
+
         try:
             tick = self._parse_tick(event)
         except (KeyError, TypeError, ValueError, ArithmeticError, ValidationError):
@@ -254,13 +328,38 @@ class BinanceStreamClient:
             )
         return None
 
-    async def _send_subscription(self, method: str, symbols: list[str]) -> None:
+    def _parse_order_book(
+        self, event: dict[str, Any], stream_name: str
+    ) -> PartialOrderBook:
+        symbol = stream_name.split("@", 1)[0].upper()
+        bids = tuple(
+            OrderBookLevel(price=price, quantity=quantity)
+            for price, quantity in event["bids"][: self._settings.order_book_depth_levels]
+            if Decimal(quantity) > 0
+        )
+        asks = tuple(
+            OrderBookLevel(price=price, quantity=quantity)
+            for price, quantity in event["asks"][: self._settings.order_book_depth_levels]
+            if Decimal(quantity) > 0
+        )
+        return PartialOrderBook(
+            symbol=symbol,
+            last_update_id=event["lastUpdateId"],
+            timestamp=datetime.now(UTC),
+            bids=bids,
+            asks=asks,
+        )
+
+    def _ticker_stream(self, symbol: str) -> str:
+        return f"{symbol.lower()}{self._settings.market_stream_suffix}"
+
+    def _depth_stream(self, symbol: str) -> str:
+        return f"{symbol.lower()}{self._settings.order_book_stream_suffix}"
+
+    async def _send_streams(self, method: str, streams: list[str]) -> None:
         websocket = self._websocket
         if websocket is None or not self.connected:
             return
-        streams = [
-            f"{symbol.lower()}{self._settings.market_stream_suffix}" for symbol in symbols
-        ]
         async with self._send_lock:
             elapsed = monotonic() - self._last_control_sent_at
             wait_time = self._settings.websocket_control_interval_seconds - elapsed

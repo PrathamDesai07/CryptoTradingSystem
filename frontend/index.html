@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Crypto Trading System</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -35,12 +36,139 @@
         <div id="tick-grid" class="tick-grid"></div>
       </section>
 
+      <section id="market-detail" class="panel" hidden>
+        <nav id="market-tabs" class="market-tabs" aria-label="Active markets"></nav>
+        <div class="panel-heading market-heading">
+          <div class="market-identity">
+            <p class="eyebrow">Selected market</p>
+            <div class="market-title-row">
+              <h2 id="detail-symbol">--</h2>
+              <span class="market-type">Spot</span>
+            </div>
+          </div>
+          <div class="market-price-block">
+            <strong id="detail-price">--</strong>
+            <span id="detail-change">Waiting for live price</span>
+          </div>
+          <div class="detail-actions">
+            <button id="close-detail" class="secondary" type="button">Close</button>
+          </div>
+        </div>
+        <div class="trading-workspace">
+          <div class="chart-pane">
+            <div class="chart-toolbar">
+              <span class="toolbar-label">Time</span>
+              <div id="timeframe-options" class="timeframe-options"></div>
+              <span class="toolbar-divider"></span>
+              <button id="indicator-toggle" class="chart-tool" type="button" aria-pressed="false" title="Show or hide SMA and EMA">
+                <span class="indicator-icon" aria-hidden="true">⌁</span>
+                SMA/EMA off
+              </button>
+            </div>
+            <div id="indicator-legend" class="indicator-legend" hidden>
+              <span><i class="sma-dot"></i>SMA <b id="sma-period">--</b> close <strong id="sma-value">--</strong></span>
+              <span><i class="ema-dot"></i>EMA <b id="ema-period">--</b> close <strong id="ema-value">--</strong></span>
+              <span>Latest signal <strong id="latest-signal">Waiting</strong></span>
+            </div>
+            <div class="candle-grid">
+              <div><span>Open</span><strong id="candle-open">--</strong></div>
+              <div><span>High</span><strong id="candle-high">--</strong></div>
+              <div><span>Low</span><strong id="candle-low">--</strong></div>
+              <div><span>Close</span><strong id="candle-close">--</strong></div>
+            </div>
+            <div id="price-chart" class="price-chart"></div>
+            <p class="chart-attribution">
+              Charts powered by
+              <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a>
+            </p>
+          </div>
+          <aside class="book-pane">
+            <div class="book-heading">
+              <div><p class="eyebrow">Partial depth</p><h3>Order book</h3></div>
+              <div class="book-heading-actions"><span id="book-time">Waiting...</span><button id="show-order-ticket" type="button" hidden>Trade</button></div>
+            </div>
+            <div class="order-book">
+              <div class="mid-price" id="book-mid-price">--</div>
+              <div class="book-tables">
+                <table>
+                  <caption>Bids</caption>
+                  <thead><tr><th>Price</th><th>Quantity</th><th></th></tr></thead>
+                  <tbody id="bid-rows"></tbody>
+                </table>
+                <table>
+                  <caption>Asks</caption>
+                  <thead><tr><th>Price</th><th>Quantity</th><th></th></tr></thead>
+                  <tbody id="ask-rows"></tbody>
+                </table>
+              </div>
+            </div>
+            <section id="order-ticket" class="order-ticket" aria-label="Spot order ticket">
+              <div class="ticket-heading">
+                <strong>Place order</strong>
+                <div class="ticket-title-actions"><span id="execution-warning">Demo execution disabled</span><button id="close-order-ticket" type="button" aria-label="Close order ticket">Close</button></div>
+              </div>
+              <div class="side-switch" role="group" aria-label="Order side">
+                <button id="buy-side" class="buy active" type="button">Buy <kbd>B</kbd></button>
+                <button id="sell-side" class="sell" type="button">Sell <kbd>S</kbd></button>
+              </div>
+              <form id="credential-form" class="credential-panel" hidden autocomplete="off">
+                <strong>Connect Binance Demo Mode</strong>
+                <small>Credentials stay in backend memory until it stops.</small>
+                <label>API key<input id="runtime-api-key" type="password" autocomplete="off" required /></label>
+                <label>Secret key<input id="runtime-api-secret" type="password" autocomplete="new-password" required /></label>
+                <div><button type="submit">Connect &amp; continue</button><button id="cancel-credentials" class="secondary" type="button">Cancel</button></div>
+                <p id="credential-message" class="order-message" role="status"></p>
+              </form>
+              <form id="order-form" class="order-form">
+                <div class="order-type-tabs" role="group" aria-label="Order type">
+                  <button type="button" data-order-type="LIMIT" class="active">Limit <kbd>L</kbd></button>
+                  <button type="button" data-order-type="MARKET">Market <kbd>M</kbd></button>
+                  <button type="button" data-order-type="STOP_LOSS_LIMIT">Conditional</button>
+                  <button type="button" data-order-type="LIMIT_MAKER">Post only</button>
+                </div>
+                <label id="conditional-type-field" hidden>Conditional type
+                  <select id="conditional-type">
+                    <option value="STOP_LOSS_LIMIT">Stop loss limit</option>
+                    <option value="TAKE_PROFIT_LIMIT">Take profit limit</option>
+                    <option value="STOP_LOSS">Stop loss market</option>
+                    <option value="TAKE_PROFIT">Take profit market</option>
+                  </select>
+                </label>
+                <label id="price-field">Price <span>USDT</span><input id="order-price" inputmode="decimal" autocomplete="off" required /></label>
+                <label id="stop-price-field" hidden>Trigger price <span>USDT</span><input id="order-stop-price" inputmode="decimal" autocomplete="off" /></label>
+                <label>Size <span>BTC</span><input id="order-quantity" inputmode="decimal" autocomplete="off" placeholder="Quantity" /></label>
+                <label id="quote-size-field" hidden>Spend <span>USDT</span><input id="order-quote-quantity" inputmode="decimal" autocomplete="off" placeholder="Quote amount" /></label>
+                <label id="tif-field">Time in force
+                  <select id="order-tif"><option>GTC</option><option>IOC</option><option>FOK</option></select>
+                </label>
+                <button id="submit-order" class="submit-order buy" type="submit">Place demo buy order</button>
+                <small class="shortcut-hint">B/S side · L/M type · Ctrl+Enter submit · Esc clear</small>
+                <p id="order-message" class="order-message" role="status"></p>
+              </form>
+            </section>
+            <section class="order-manager">
+              <div class="ticket-heading"><strong>Positions &amp; open orders</strong><button id="refresh-orders" type="button">Refresh</button></div>
+              <div class="pnl-summary">
+                <div><span>Realized P&amp;L</span><strong id="realized-pnl">--</strong></div>
+                <div><span>Unrealized P&amp;L</span><strong id="unrealized-pnl">--</strong></div>
+                <div><span>Total P&amp;L</span><strong id="total-pnl">--</strong></div>
+              </div>
+              <div id="position-list" class="management-list"><small>No open positions</small></div>
+              <div id="open-order-list" class="management-list"><small>No open orders</small></div>
+              <h4 class="manager-subheading">Recent orders</h4>
+              <div id="recent-order-list" class="management-list"><small>No recent orders</small></div>
+            </section>
+          </aside>
+        </div>
+      </section>
+
       <section class="panel">
         <p class="eyebrow">Implementation progress</p>
         <h2>System roadmap</h2>
         <div id="feature-grid" class="feature-grid"></div>
       </section>
     </main>
+    <script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

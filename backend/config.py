@@ -42,11 +42,21 @@ class Settings(BaseModel):
     binance_api_key: SecretStr | None
     binance_api_secret: SecretStr | None
     binance_testnet_rest_url: str
+    binance_market_rest_url: str
     binance_market_ws_url: str
 
     trading_symbols: str
     market_data_enabled: bool
     market_stream_suffix: str
+    order_book_stream_suffix: str
+    order_book_depth_levels: int = Field(ge=5, le=20)
+    candle_history_size: int = Field(ge=1, le=10000)
+    candle_history_bootstrap_limit: int = Field(ge=1, le=1000)
+    candle_history_request_timeout_seconds: float = Field(gt=0)
+    candle_interval_name: str
+    candle_interval_seconds: int = Field(ge=1)
+    chart_intervals: list[str]
+    chart_history_limit: int = Field(ge=20, le=1000)
     websocket_open_timeout_seconds: float = Field(gt=0)
     websocket_close_timeout_seconds: float = Field(gt=0)
     websocket_ping_interval_seconds: float = Field(gt=0)
@@ -61,9 +71,16 @@ class Settings(BaseModel):
     websocket_max_queue: int = Field(gt=0)
     frontend_tick_poll_seconds: float = Field(gt=0)
     frontend_broadcast_interval_milliseconds: int = Field(ge=16, le=5000)
+    order_book_render_interval_milliseconds: int = Field(ge=100, le=5000)
     order_size_usdt: float = Field(gt=0)
+    order_request_timeout_seconds: float = Field(gt=0, le=60)
+    order_recv_window_milliseconds: int = Field(ge=1, le=60000)
+    exchange_info_cache_seconds: int = Field(ge=1, le=86400)
+    state_database_path: str
     fast_sma_period: int = Field(ge=1)
     slow_ema_period: int = Field(ge=2)
+    strategy_signal_history_size: int = Field(ge=1, le=10000)
+    strategy_indicator_history_size: int = Field(ge=1, le=10000)
     variant_a_stop_loss_percent: float = Field(gt=0, lt=100)
     variant_b_stop_loss_percent: float = Field(gt=0, lt=100)
     take_profit_percent: float = Field(gt=0)
@@ -87,7 +104,7 @@ class Settings(BaseModel):
             raise ValueError("TRADING_SYMBOLS may contain only letters and numbers")
         return ",".join(dict.fromkeys(symbols))
 
-    @field_validator("market_stream_suffix")
+    @field_validator("market_stream_suffix", "order_book_stream_suffix")
     @classmethod
     def validate_stream_suffix(cls, value: str) -> str:
         if not value.startswith("@") or len(value) < 2:
@@ -104,6 +121,17 @@ class Settings(BaseModel):
         )
         if not normalized.startswith(allowed_hosts):
             raise ValueError("BINANCE_MARKET_WS_URL must use an official Binance stream")
+        return normalized
+
+    @field_validator("binance_testnet_rest_url")
+    @classmethod
+    def validate_order_rest_url(cls, value: str) -> str:
+        normalized = value.rstrip("/")
+        if normalized not in {
+            "https://testnet.binance.vision",
+            "https://demo-api.binance.com",
+        }:
+            raise ValueError("BINANCE_TESTNET_REST_URL must use Binance Spot Testnet or Demo Mode")
         return normalized
 
     @property

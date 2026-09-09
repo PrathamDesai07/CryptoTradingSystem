@@ -23,12 +23,28 @@ cors_allow_headers:
 
 binance_api_key: ${BINANCE_API_KEY:-}
 binance_api_secret: ${BINANCE_API_SECRET:-}
-binance_testnet_rest_url: https://testnet.binance.vision
-binance_market_ws_url: wss://stream.binance.com/ws
+binance_testnet_rest_url: https://demo-api.binance.com
+binance_market_rest_url: https://api.binance.com
+binance_market_ws_url: wss://stream.binance.com/stream
 
 trading_symbols: BTCUSDT,ETHUSDT
 market_data_enabled: true
 market_stream_suffix: "@ticker"
+order_book_stream_suffix: "@depth10@100ms"
+order_book_depth_levels: 10
+candle_history_size: 120
+candle_history_bootstrap_limit: 120
+candle_history_request_timeout_seconds: 10
+candle_interval_name: 1m
+candle_interval_seconds: 60
+chart_intervals:
+  - 1m
+  - 5m
+  - 15m
+  - 1h
+  - 4h
+  - 1d
+chart_history_limit: 300
 websocket_open_timeout_seconds: 10
 websocket_close_timeout_seconds: 10
 websocket_ping_interval_seconds: 20
@@ -43,9 +59,16 @@ websocket_max_message_bytes: 1048576
 websocket_max_queue: 256
 frontend_tick_poll_seconds: 5
 frontend_broadcast_interval_milliseconds: 100
+order_book_render_interval_milliseconds: 500
 order_size_usdt: 10
+order_request_timeout_seconds: 10
+order_recv_window_milliseconds: 5000
+exchange_info_cache_seconds: 3600
+state_database_path: data/trading_state.db
 fast_sma_period: 5
 slow_ema_period: 10
+strategy_signal_history_size: 200
+strategy_indicator_history_size: 500
 variant_a_stop_loss_percent: 10
 variant_b_stop_loss_percent: 15
 take_profit_percent: 5
