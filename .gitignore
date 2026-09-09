@@ -153,6 +153,14 @@ activemq-data/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+# Command Code session/tooling data
+.commandcode/
+
+# SQLite databases and credential keys under the db/ folder
+db/*.db
+db/*.db-shm
+db/*.db-wal
+db/.master_key
 .envrc
 .venv
 env/

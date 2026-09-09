@@ -8,12 +8,45 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <div id="auth-screen" class="auth-overlay">
+      <div class="auth-card">
+        <div class="auth-brand">
+          <p class="eyebrow">Crypto Trading System</p>
+          <h2>Sign in</h2>
+        </div>
+        <div class="auth-tabs" role="group" aria-label="Sign in or create an account">
+          <button id="auth-tab-login" class="active" type="button">Sign in</button>
+          <button id="auth-tab-signup" type="button">Sign up</button>
+        </div>
+        <p id="auth-message" class="auth-message" role="status"></p>
+        <form id="login-form" class="auth-form">
+          <label>Username<input id="login-username" autocomplete="username" required /></label>
+          <label>Password<input id="login-password" type="password" autocomplete="current-password" required /></label>
+          <button type="submit">Sign in</button>
+        </form>
+        <form id="signup-form" class="auth-form" hidden autocomplete="off">
+          <label>Username <small>unique name used to sign in</small><input id="signup-username" autocomplete="username" required /></label>
+          <label>Password <small>at least 6 characters</small><input id="signup-password" type="password" autocomplete="new-password" minlength="6" required /></label>
+          <label>Binance Demo API key<input id="signup-api-key" type="password" autocomplete="off" required /></label>
+          <label>Binance Demo secret key<input id="signup-api-secret" type="password" autocomplete="off" required /></label>
+          <button type="submit">Create account</button>
+        </form>
+        <small class="auth-footnote">Keys are encrypted at rest and are only used to sign Binance Demo Mode requests for your account.</small>
+      </div>
+    </div>
+
     <header>
       <div>
         <p id="market-data-label" class="eyebrow">Binance Spot Live Market Data</p>
         <h1 id="app-title">Crypto Trading System</h1>
       </div>
-      <div id="connection-badge" class="badge offline">Connecting</div>
+      <div class="header-actions">
+        <div id="connection-badge" class="badge offline">Connecting</div>
+        <div id="user-area" hidden>
+          <span id="auth-user" class="badge"></span>
+          <button id="logout-button" class="secondary" type="button">Sign out</button>
+        </div>
+      </div>
     </header>
 
     <main>
@@ -119,10 +152,10 @@
               </div>
               <form id="credential-form" class="credential-panel" hidden autocomplete="off">
                 <strong>Connect Binance Demo Mode</strong>
-                <small>Credentials stay in backend memory until it stops.</small>
+                <small>Keys are encrypted in the database and used only for your account.</small>
                 <label>API key<input id="runtime-api-key" type="password" autocomplete="off" required /></label>
                 <label>Secret key<input id="runtime-api-secret" type="password" autocomplete="new-password" required /></label>
-                <div><button type="submit">Connect &amp; continue</button><button id="cancel-credentials" class="secondary" type="button">Cancel</button></div>
+                <div class="credential-actions"><button type="submit">Connect &amp; continue</button><button id="retry-stored-credentials" class="secondary" type="button">Retry stored keys</button><button id="cancel-credentials" class="secondary" type="button">Cancel</button></div>
                 <p id="credential-message" class="order-message" role="status"></p>
               </form>
               <form id="order-form" class="order-form">

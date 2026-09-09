@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import deque
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN
 import hashlib
@@ -21,6 +22,23 @@ from models import ExitReason, Position, PositionStatus, Signal, SignalAction, S
 from services.state_repository import StateRepository
 
 logger = logging.getLogger(__name__)
+
+# The user whose Binance Demo credentials sign the current request. Background
+# strategy/risk tasks run without a bound user and keep using process-level
+# credentials, exactly as before multi-user support.
+current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
+
+
+class _UserSession:
+    """Decrypted in-memory credentials for one logged-in account."""
+
+    __slots__ = ("api_key", "api_secret", "verified", "enabled")
+
+    def __init__(self, api_key: SecretStr, api_secret: SecretStr) -> None:
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.verified = False
+        self.enabled = False
 
 
 class BinanceOrderError(RuntimeError):
@@ -45,7 +63,7 @@ class OrderService:
         "OPOCO": "/api/v3/orderList/opoco",
     }
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, repository: Any | None = None) -> None:
         self._settings = settings
         self._positions: dict[tuple[str, StrategyVariant], Position] = {}
         self._orders: dict[str, dict[str, Any]] = {}
@@ -57,9 +75,10 @@ class OrderService:
         self._runtime_api_key: SecretStr | None = None
         self._runtime_api_secret: SecretStr | None = None
         self._session_execution_enabled = False
+        self._user_sessions: dict[int, _UserSession] = {}
         self._strategy_order_quantity = Decimal(str(settings.strategy_order_quantity))
         self._squared_orders: set[tuple[str, int]] = set()
-        self._repository = StateRepository(settings.state_database_path, settings.strategy_signal_history_size)
+        self._repository = repository or StateRepository(settings.state_database_path, settings.strategy_signal_history_size)
         for record in self._repository.load_orders():
             self._history.append(record)
             client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
@@ -70,15 +89,38 @@ class OrderService:
 
     @property
     def execution_enabled(self) -> bool:
+        """Per-user kill switch when a request is bound, process-level otherwise."""
+        if current_user_id.get() is not None:
+            session = self._session()
+            return bool(session and session.enabled)
         return self._settings.order_execution_enabled or self._session_execution_enabled
 
     @property
     def credentials_configured(self) -> bool:
-        return bool(self._api_key() and self._api_secret())
+        if current_user_id.get() is not None:
+            return self._session() is not None
+        return bool(self._runtime_api_key or self._settings.binance_api_key) and bool(
+            self._runtime_api_secret or self._settings.binance_api_secret
+        )
 
     @property
     def runtime_session_active(self) -> bool:
+        if current_user_id.get() is not None:
+            session = self._session()
+            return bool(session and session.verified and session.enabled)
         return bool(self._runtime_api_key and self._runtime_api_secret and self._session_execution_enabled)
+
+    @property
+    def session_verified(self) -> bool:
+        session = self._session()
+        return bool(session and session.verified)
+
+    def _session(self, user_id: int | None = None) -> _UserSession | None:
+        if user_id is None:
+            user_id = current_user_id.get()
+        if user_id is None:
+            return None
+        return self._user_sessions.get(user_id)
 
     @property
     def strategy_order_quantity(self) -> Decimal:
@@ -118,6 +160,49 @@ class OrderService:
         self._runtime_api_key = None
         self._runtime_api_secret = None
         self._session_execution_enabled = False
+
+    async def connect_user_credentials(self, user_id: int, api_key: str, api_secret: str) -> dict[str, Any]:
+        """Activate one account's in-memory session and verify it against Binance.
+
+        Persisting the encrypted keys is the caller's job; this only keeps the
+        decrypted values for the lifetime of the backend process. A failed
+        verification (bad keys or Binance unreachable) is reported in the result
+        instead of raised so sign-up and sign-in still complete.
+        """
+        if not api_key.strip() or not api_secret.strip():
+            raise BinanceOrderError("API key and secret are required", 422)
+        self._user_sessions[user_id] = _UserSession(SecretStr(api_key.strip()), SecretStr(api_secret.strip()))
+        token = current_user_id.set(user_id)
+        try:
+            try:
+                account = await self.account()
+                can_trade = bool(account.get("canTrade"))
+            except BinanceOrderError as error:
+                return {"connected": False, "verified": False, "can_trade": False, "error": str(error)}
+            session = self._session(user_id)
+            if session is None:
+                return {"connected": False, "verified": False, "can_trade": False, "error": "session was removed during verification"}
+            session.verified = True
+            session.enabled = can_trade
+            if not can_trade:
+                return {"connected": True, "verified": True, "can_trade": False, "error": "these Binance Demo credentials are not permitted to trade"}
+            return {"connected": True, "verified": True, "can_trade": True, "error": None}
+        finally:
+            current_user_id.reset(token)
+
+    def deactivate_user_session(self, user_id: int) -> None:
+        """Drop the in-memory decrypted keys for an account (logout)."""
+        self._user_sessions.pop(user_id, None)
+
+    def has_active_session(self, user_id: int) -> bool:
+        return user_id in self._user_sessions
+
+    async def order_log(self, symbol: str | None = None, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        """Audit rows for the bound user; falls back to legacy history otherwise."""
+        user_id = current_user_id.get()
+        if user_id is not None and hasattr(self._repository, "get_user_orders"):
+            return tuple(self._repository.get_user_orders(user_id, symbol, limit))
+        return await self.orders(symbol, limit)
 
     async def positions(self, symbol: str | None = None) -> tuple[Position, ...]:
         async with self._lock:
@@ -513,6 +598,13 @@ class OrderService:
 
     async def _record(self, response: dict[str, Any], request_params: dict[str, Any]) -> None:
         record = {**request_params, **response, "recordedAt": datetime.now(UTC).isoformat()}
+        user_id = current_user_id.get()
+        if user_id is not None:
+            # A signed-in account: persist a queryable audit row (status, price,
+            # quantity, timestamps) without touching the process-global history.
+            if hasattr(self._repository, "log_user_order"):
+                self._repository.log_user_order(user_id, record)
+            return
         client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
         async with self._lock:
             if client_id:
@@ -565,10 +657,22 @@ class OrderService:
             raise BinanceOrderError("Binance request failed; reconcile by client order ID before retrying") from error
 
     def _api_key(self) -> str:
+        user_id = current_user_id.get()
+        if user_id is not None:
+            session = self._session(user_id)
+            if session is None or session.api_key is None:
+                raise BinanceOrderError("Binance Demo credentials are not configured for this account", 503)
+            return session.api_key.get_secret_value()
         value = self._runtime_api_key or self._settings.binance_api_key
         return "" if value is None else value.get_secret_value()
 
     def _api_secret(self) -> str:
+        user_id = current_user_id.get()
+        if user_id is not None:
+            session = self._session(user_id)
+            if session is None or session.api_secret is None:
+                raise BinanceOrderError("Binance Demo credentials are not configured for this account", 503)
+            return session.api_secret.get_secret_value()
         value = self._runtime_api_secret or self._settings.binance_api_secret
         return "" if value is None else value.get_secret_value()
 

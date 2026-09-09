@@ -5,6 +5,13 @@ const socketUrl = () => {
   return url;
 };
 
+const TOKEN_KEY = "cts_token";
+const getAuthToken = () => window.localStorage.getItem(TOKEN_KEY) || "";
+const storeAuthToken = (token) => {
+  if (token) window.localStorage.setItem(TOKEN_KEY, token);
+  else window.localStorage.removeItem(TOKEN_KEY);
+};
+
 const state = {
   ticks: new Map(),
   symbols: new Set(),
@@ -113,17 +120,38 @@ const elements = {
   strategyOrderQuantity: document.querySelector("#strategy-order-quantity"),
   strategyOrderAsset: document.querySelector("#strategy-order-asset"),
   strategyQuantityStatus: document.querySelector("#strategy-quantity-status"),
+  authScreen: document.querySelector("#auth-screen"),
+  authTabLogin: document.querySelector("#auth-tab-login"),
+  authTabSignup: document.querySelector("#auth-tab-signup"),
+  authMessage: document.querySelector("#auth-message"),
+  loginForm: document.querySelector("#login-form"),
+  loginUsername: document.querySelector("#login-username"),
+  loginPassword: document.querySelector("#login-password"),
+  signupForm: document.querySelector("#signup-form"),
+  signupUsername: document.querySelector("#signup-username"),
+  signupPassword: document.querySelector("#signup-password"),
+  signupApiKey: document.querySelector("#signup-api-key"),
+  signupApiSecret: document.querySelector("#signup-api-secret"),
+  userArea: document.querySelector("#user-area"),
+  authUser: document.querySelector("#auth-user"),
+  logoutButton: document.querySelector("#logout-button"),
+  retryStoredCredentials: document.querySelector("#retry-stored-credentials"),
 };
 
 async function request(path, options = {}) {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 15000);
+  const token = getAuthToken();
   let response;
   try {
     response = await fetch(apiUrl(path), {
       ...options,
       signal: controller.signal,
-      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(options.headers || {}),
+      },
     });
   } catch (error) {
     if (error.name === "AbortError") throw new Error("The backend request timed out. Check order status before retrying.");
@@ -133,6 +161,10 @@ async function request(path, options = {}) {
   }
   const body = await response.json().catch(() => ({}));
   const detail = typeof body.detail === "object" ? body.detail?.message : body.detail;
+  if (response.status === 401 && token) {
+    storeAuthToken("");
+    showAuthGate("login", "Your session expired. Sign in again.");
+  }
   if (!response.ok) throw new Error(detail || `Request failed: ${response.status}`);
   return body;
 }
@@ -285,11 +317,13 @@ async function loadOrderSession() {
 }
 
 function renderOrderSession() {
-  elements.executionWarning.textContent = state.credentialsConfigured
+  elements.executionWarning.textContent = state.orderExecutionEnabled
     ? "Demo session connected"
-    : "Credentials required";
-  elements.executionWarning.classList.toggle("enabled", state.credentialsConfigured);
-  elements.submitOrder.textContent = state.credentialsConfigured
+    : state.credentialsConfigured
+      ? "Credentials need verification"
+      : "Credentials required";
+  elements.executionWarning.classList.toggle("enabled", state.orderExecutionEnabled);
+  elements.submitOrder.textContent = state.orderExecutionEnabled
     ? `Place demo ${state.orderSide.toLowerCase()} order`
     : "Connect to place order";
   elements.orderState.textContent = state.orderExecutionEnabled ? "Enabled" : "Disabled";
@@ -684,10 +718,10 @@ elements.conditionalType.addEventListener("change", () => setOrderType("CONDITIO
 elements.orderForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.selectedSymbol) return;
-  if (!state.credentialsConfigured) {
+  if (!state.orderExecutionEnabled) {
     elements.credentialForm.hidden = false;
-    elements.runtimeApiKey.focus();
-    elements.credentialMessage.textContent = "Enter newly generated Binance Demo credentials.";
+    elements.credentialMessage.textContent = "Connect Binance Demo keys or retry the stored keys to enable order placement.";
+    (state.credentialsConfigured ? elements.retryStoredCredentials : elements.runtimeApiKey).focus();
     return;
   }
   const type = state.orderType === "CONDITIONAL" ? elements.conditionalType.value : state.orderType;
@@ -1173,7 +1207,11 @@ elements.closeDetail.addEventListener("click", () => {
   document.body.classList.remove("trading-mode");
 });
 
-async function initialize() {
+let dashboardStarted = false;
+
+async function startDashboard() {
+  if (dashboardStarted) return;
+  dashboardStarted = true;
   try {
     await Promise.all([loadPublicConfig(), loadDashboard()]);
     await loadOrderSession();
@@ -1185,4 +1223,104 @@ async function initialize() {
   }
 }
 
-initialize();
+function setAuthTab(tab) {
+  const login = tab === "login";
+  elements.loginForm.hidden = !login;
+  elements.signupForm.hidden = login;
+  elements.authTabLogin.classList.toggle("active", login);
+  elements.authTabSignup.classList.toggle("active", !login);
+}
+
+function showAuthGate(tab = "login", message = "") {
+  storeAuthToken("");
+  elements.userArea.hidden = true;
+  elements.authMessage.classList.remove("error");
+  setAuthTab(tab);
+  elements.authMessage.textContent = message;
+  elements.authScreen.hidden = false;
+}
+
+async function enterDashboard(result) {
+  const username = result?.user?.username || "";
+  elements.authUser.textContent = username ? `Signed in as ${username}` : "Signed in";
+  elements.authMessage.textContent = "";
+  elements.authScreen.hidden = true;
+  elements.userArea.hidden = false;
+  await startDashboard();
+}
+
+async function submitAuth(route, payload, button) {
+  button.disabled = true;
+  elements.authMessage.classList.remove("error");
+  elements.authMessage.textContent = "Please wait...";
+  try {
+    const result = await request(route, { method: "POST", body: JSON.stringify(payload) });
+    storeAuthToken(result.token);
+    await enterDashboard(result);
+  } catch (error) {
+    elements.authMessage.classList.add("error");
+    elements.authMessage.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+elements.authTabLogin.addEventListener("click", () => { elements.authMessage.textContent = ""; setAuthTab("login"); });
+elements.authTabSignup.addEventListener("click", () => { elements.authMessage.textContent = ""; setAuthTab("signup"); });
+
+elements.loginForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await submitAuth("auth/login", {
+    username: elements.loginUsername.value.trim(),
+    password: elements.loginPassword.value,
+  }, elements.loginForm.querySelector("button[type='submit']"));
+});
+
+elements.signupForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await submitAuth("auth/signup", {
+    username: elements.signupUsername.value.trim(),
+    password: elements.signupPassword.value,
+    api_key: elements.signupApiKey.value.trim(),
+    api_secret: elements.signupApiSecret.value.trim(),
+  }, elements.signupForm.querySelector("button[type='submit']"));
+});
+
+elements.logoutButton.addEventListener("click", async () => {
+  try {
+    await request("auth/logout", { method: "POST" });
+  } catch (_) {
+    // The session is already invalid; the reload below clears local state.
+  }
+  storeAuthToken("");
+  window.location.reload();
+});
+
+elements.retryStoredCredentials.addEventListener("click", async () => {
+  elements.credentialMessage.textContent = "Verifying stored keys with Binance Demo Mode...";
+  try {
+    await request("auth/verify-binance", { method: "POST" });
+    elements.credentialMessage.textContent = "";
+    elements.credentialForm.hidden = true;
+    state.credentialsConfigured = true;
+    state.orderExecutionEnabled = true;
+    renderOrderSession();
+  } catch (error) {
+    elements.credentialMessage.textContent = error.message;
+  }
+});
+
+async function bootstrap() {
+  if (!getAuthToken()) {
+    showAuthGate("login");
+    return;
+  }
+  try {
+    const result = await request("auth/me");
+    await enterDashboard(result);
+  } catch (_) {
+    showAuthGate("login", "Your session expired. Sign in again.");
+  }
+}
+
+bootstrap();

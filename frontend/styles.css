@@ -13,6 +13,8 @@
 
 * { box-sizing: border-box; }
 
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   font-family: Inter, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
@@ -205,3 +207,37 @@ body.trading-mode .price-chart { height: calc(100vh - 250px); min-height: 480px;
   .market-heading { grid-template-columns: 1fr auto; }
   .market-price-block { grid-column: 1 / -1; margin: 14px 0 0; }
 }
+
+/* Header user area */
+.header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+#user-area { display: flex; align-items: center; gap: 8px; }
+#auth-user { color: var(--accent); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Sign in / sign up gate */
+.auth-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  display: grid; place-items: center; padding: 24px;
+  background: radial-gradient(circle at top left, #152c49 0, #050b14 55%);
+  overflow-y: auto;
+}
+.auth-overlay[hidden] { display: none; }
+.auth-card {
+  width: min(420px, 100%);
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 18px; padding: 26px; box-shadow: 0 24px 70px rgba(0, 0, 0, .45);
+}
+.auth-brand h2 { font-size: 1.6rem; letter-spacing: -.03em; }
+.auth-tabs { display: flex; gap: 6px; margin: 18px 0 4px; }
+.auth-tabs button { flex: 1; background: transparent; color: var(--muted); }
+.auth-tabs button.active { color: var(--text); background: #1a2c47; }
+.auth-form { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+.auth-form label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: .86rem; font-weight: 600; }
+.auth-form label small { font-weight: 400; }
+.auth-form input { text-transform: none; }
+.auth-form button { padding: 12px; }
+.auth-message { min-height: 1.2rem; margin: 10px 0 0; color: #ffcf66; font-size: .86rem; }
+.auth-message.error { color: var(--danger); }
+.auth-footnote { display: block; margin-top: 16px; color: var(--muted); font-size: .76rem; line-height: 1.45; }
+.credential-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.credential-actions button { flex: 1; }
+

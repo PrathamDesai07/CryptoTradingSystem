@@ -66,7 +66,8 @@ strategy_order_quantity: 0.0001
 order_request_timeout_seconds: 10
 order_recv_window_milliseconds: 5000
 exchange_info_cache_seconds: 3600
-state_database_path: data/trading_state.db
+# SQLite file lives under the repository db/ folder for future development.
+state_database_path: db/trading_state.db
 fast_sma_period: 5
 slow_ema_period: 10
 strategy_signal_history_size: 200
@@ -75,3 +76,7 @@ variant_a_stop_loss_percent: 10
 variant_b_stop_loss_percent: 15
 take_profit_percent: 5
 order_execution_enabled: false
+# Base64 Fernet key for encrypting stored user credentials. Generate one with:
+#   python -c "import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+# When unset the backend generates and stores a key next to the database file.
+credentials_master_key: ${CREDENTIALS_MASTER_KEY:-}

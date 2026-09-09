@@ -1,5 +1,6 @@
 """Trading-system service package."""
 
+from .db_handler import DatabaseHandler
 from .market_data import BinanceStreamClient
 from .candle_service import CandleService
 from .order_book_store import OrderBookStore
@@ -12,6 +13,7 @@ from .tick_store import TickStore
 __all__ = [
     "BinanceStreamClient",
     "CandleService",
+    "DatabaseHandler",
     "OrderBookStore",
     "BinanceOrderError",
     "OrderService",

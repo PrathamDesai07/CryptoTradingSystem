@@ -86,6 +86,9 @@ class Settings(BaseModel):
     variant_b_stop_loss_percent: float = Field(gt=0, lt=100)
     take_profit_percent: float = Field(gt=0)
     order_execution_enabled: bool
+    # Base64-encoded 32-byte Fernet key used to encrypt stored Binance Demo
+    # credentials. When absent the key is auto-generated next to the database.
+    credentials_master_key: SecretStr | None = None
 
     @field_validator("log_level")
     @classmethod

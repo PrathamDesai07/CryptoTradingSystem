@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from api.auth_routes import router as auth_router
 from api.routes import router, websocket_router
 from config import get_settings
 from logging_config import configure_logging
@@ -18,6 +19,7 @@ from models import Candle, Signal, Tick
 from services import (
     BinanceStreamClient,
     CandleService,
+    DatabaseHandler,
     OrderBookStore,
     OrderService,
     StrategyService,
@@ -31,7 +33,12 @@ logger = logging.getLogger(__name__)
 tick_store = TickStore()
 order_book_store = OrderBookStore()
 tick_broadcaster = TickBroadcaster(settings.frontend_broadcast_interval_milliseconds)
-order_service = OrderService(settings)
+db_handler = DatabaseHandler(
+    settings.state_database_path,
+    settings.strategy_signal_history_size,
+    master_key=settings.credentials_master_key.get_secret_value() if settings.credentials_master_key else None,
+)
+order_service = OrderService(settings, repository=db_handler)
 
 
 async def handle_signal(signal: Signal) -> None:
@@ -132,6 +139,7 @@ app.state.market_data_client = market_data_client
 app.state.candle_service = candle_service
 app.state.strategy_service = strategy_service
 app.state.order_service = order_service
+app.state.db_handler = db_handler
 
 app.add_middleware(
     CORSMiddleware,
@@ -142,6 +150,7 @@ app.add_middleware(
 )
 
 app.include_router(router, prefix=settings.api_prefix)
+app.include_router(auth_router, prefix=settings.api_prefix)
 app.include_router(websocket_router)
 
 frontend_directory = Path(__file__).resolve().parent.parent / "frontend"
