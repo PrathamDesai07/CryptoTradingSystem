@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+__pycache__
+*.py[cod]
+.env
+.env.*
+!.env.example
+.docx_review
+data
+tests
+Assignment.docx
+README.md
+LICENSE

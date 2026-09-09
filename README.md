@@ -522,3 +522,28 @@ log with automated tests for the critical calculations.
 - Validate every symbol and order against Binance exchange filters.
 - Provide a kill switch before enabling automated order placement.
 - Treat REST/WebSocket data as untrusted input and validate it.
+
+# Continuous integration and delivery
+
+The GitHub Actions workflow in `.github/workflows/ci-cd.yml` runs the Python
+test suite, compiles the backend, validates the frontend JavaScript, imports the
+application with external market streaming disabled, and smoke-tests a complete
+Docker image for every pull request and push to `main`.
+
+After a successful `main` build, it publishes these images to GitHub Container
+Registry:
+
+- `ghcr.io/prathamdesai07/cryptotradingsystem:latest`
+- `ghcr.io/prathamdesai07/cryptotradingsystem:sha-<commit>`
+
+Run the same production image locally with persistent trading state:
+
+```powershell
+docker build -t crypto-trading-system .
+docker run --rm -p 8000:8000 -v crypto-trading-data:/app/data crypto-trading-system
+```
+
+Open `http://localhost:8000/dashboard/`. Credentials are not built into the
+image; enter Demo Mode credentials at runtime or inject them through protected
+deployment secrets. Automatic order execution remains disabled unless a valid
+runtime session is connected or the explicit execution setting is enabled.
