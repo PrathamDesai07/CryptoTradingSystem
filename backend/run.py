@@ -1,0 +1,39 @@
+"""Single-process launcher for the API and its bundled frontend."""
+
+import threading
+import webbrowser
+from pathlib import Path
+
+import uvicorn
+
+from config import get_settings
+
+
+def open_dashboard(url: str, delay_seconds: float) -> None:
+    """Open the dashboard after Uvicorn has had time to bind its socket."""
+    timer = threading.Timer(delay_seconds, webbrowser.open, args=(url,))
+    timer.daemon = True
+    timer.start()
+
+
+def main() -> None:
+    settings = get_settings()
+    dashboard_url = (
+        f"http://{settings.app_host}:{settings.app_port}"
+        f"{settings.frontend_mount_path}/"
+    )
+    if settings.open_browser_on_start:
+        open_dashboard(dashboard_url, settings.browser_open_delay_seconds)
+
+    uvicorn.run(
+        "main:app",
+        app_dir=str(Path(__file__).resolve().parent),
+        host=settings.app_host,
+        port=settings.app_port,
+        log_level=settings.log_level.lower(),
+        reload=False,
+    )
+
+
+if __name__ == "__main__":
+    main()

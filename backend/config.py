@@ -24,10 +24,14 @@ class Settings(BaseModel):
     app_environment: AppEnvironment
     app_title: str
     root_message: str
+    market_data_label: str
     app_host: str
     app_port: int = Field(ge=1, le=65535)
     log_level: str
     api_prefix: str
+    frontend_mount_path: str
+    open_browser_on_start: bool
+    browser_open_delay_seconds: float = Field(ge=0)
     docs_url: str
     redoc_url: str
     cors_origins: str
@@ -38,9 +42,25 @@ class Settings(BaseModel):
     binance_api_key: SecretStr | None
     binance_api_secret: SecretStr | None
     binance_testnet_rest_url: str
-    binance_testnet_ws_url: str
+    binance_market_ws_url: str
 
     trading_symbols: str
+    market_data_enabled: bool
+    market_stream_suffix: str
+    websocket_open_timeout_seconds: float = Field(gt=0)
+    websocket_close_timeout_seconds: float = Field(gt=0)
+    websocket_ping_interval_seconds: float = Field(gt=0)
+    websocket_ping_timeout_seconds: float = Field(gt=0)
+    websocket_stale_timeout_seconds: float = Field(gt=0)
+    websocket_reconnect_initial_seconds: float = Field(gt=0)
+    websocket_reconnect_max_seconds: float = Field(gt=0)
+    websocket_reconnect_jitter_ratio: float = Field(ge=0, le=1)
+    websocket_control_interval_seconds: float = Field(gt=0)
+    websocket_max_streams: int = Field(ge=1, le=1024)
+    websocket_max_message_bytes: int = Field(gt=0)
+    websocket_max_queue: int = Field(gt=0)
+    frontend_tick_poll_seconds: float = Field(gt=0)
+    frontend_broadcast_interval_milliseconds: int = Field(ge=16, le=5000)
     order_size_usdt: float = Field(gt=0)
     fast_sma_period: int = Field(ge=1)
     slow_ema_period: int = Field(ge=2)
@@ -66,6 +86,25 @@ class Settings(BaseModel):
         if any(not symbol.isalnum() for symbol in symbols):
             raise ValueError("TRADING_SYMBOLS may contain only letters and numbers")
         return ",".join(dict.fromkeys(symbols))
+
+    @field_validator("market_stream_suffix")
+    @classmethod
+    def validate_stream_suffix(cls, value: str) -> str:
+        if not value.startswith("@") or len(value) < 2:
+            raise ValueError("MARKET_STREAM_SUFFIX must start with @")
+        return value
+
+    @field_validator("binance_market_ws_url")
+    @classmethod
+    def validate_market_stream_url(cls, value: str) -> str:
+        normalized = value.rstrip("/")
+        allowed_hosts = (
+            "wss://stream.binance.com",
+            "wss://stream.testnet.binance.vision",
+        )
+        if not normalized.startswith(allowed_hosts):
+            raise ValueError("BINANCE_MARKET_WS_URL must use an official Binance stream")
+        return normalized
 
     @property
     def symbols(self) -> tuple[str, ...]:

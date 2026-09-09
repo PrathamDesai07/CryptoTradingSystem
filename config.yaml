@@ -4,10 +4,14 @@
 app_environment: development
 app_title: Crypto Trading System API
 root_message: Crypto Trading System API
+market_data_label: Binance Spot Live Market Data
 app_host: 127.0.0.1
 app_port: 8000
 log_level: INFO
 api_prefix: /api
+frontend_mount_path: /dashboard
+open_browser_on_start: true
+browser_open_delay_seconds: 1
 docs_url: /docs
 redoc_url: /redoc
 cors_origins: http://localhost:3000,http://127.0.0.1:3000
@@ -20,9 +24,25 @@ cors_allow_headers:
 binance_api_key: ${BINANCE_API_KEY:-}
 binance_api_secret: ${BINANCE_API_SECRET:-}
 binance_testnet_rest_url: https://testnet.binance.vision
-binance_testnet_ws_url: wss://testnet.binance.vision/ws
+binance_market_ws_url: wss://stream.binance.com/ws
 
 trading_symbols: BTCUSDT,ETHUSDT
+market_data_enabled: true
+market_stream_suffix: "@ticker"
+websocket_open_timeout_seconds: 10
+websocket_close_timeout_seconds: 10
+websocket_ping_interval_seconds: 20
+websocket_ping_timeout_seconds: 60
+websocket_stale_timeout_seconds: 60
+websocket_reconnect_initial_seconds: 1
+websocket_reconnect_max_seconds: 60
+websocket_reconnect_jitter_ratio: 0.2
+websocket_control_interval_seconds: 0.25
+websocket_max_streams: 1024
+websocket_max_message_bytes: 1048576
+websocket_max_queue: 256
+frontend_tick_poll_seconds: 5
+frontend_broadcast_interval_milliseconds: 100
 order_size_usdt: 10
 fast_sma_period: 5
 slow_ema_period: 10

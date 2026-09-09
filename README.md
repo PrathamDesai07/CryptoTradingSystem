@@ -1,8 +1,8 @@
 # Crypto Trading System
 
-A real-time crypto trading system that consumes Binance Testnet market data,
+A real-time crypto trading system that consumes public Binance Spot market data,
 builds one-minute OHLC candles, runs two SMA/EMA strategy variants, places sample
-orders, and exposes the system state to a JavaScript frontend.
+orders on Binance Testnet, and exposes the system state to a JavaScript frontend.
 
 > This repository currently contains only the initial project structure and
 > placeholder API/frontend files. The features below are the implementation
@@ -11,7 +11,7 @@ orders, and exposes the system state to a JavaScript frontend.
 ## Target architecture
 
 ```text
-Binance Testnet WebSocket
+Binance Spot public WebSocket
           |
           v
     Market data service ---> Tick store
@@ -100,6 +100,19 @@ python -m uvicorn main:app --app-dir backend --reload
 The API is then available at `http://127.0.0.1:8000`. In development, its
 interactive documentation is available at `http://127.0.0.1:8000/docs`.
 
+#### One-command startup
+
+From PowerShell in the repository root, run:
+
+```powershell
+.\start.ps1
+```
+
+The launcher creates `.venv` when necessary, installs the pinned dependencies,
+creates a local `.env` from `.env.example` when missing, starts the backend, and
+opens the API-served JavaScript dashboard. The backend and frontend share one
+process, so pressing `Ctrl+C` stops the complete application.
+
 Before entering real Testnet credentials in `.env`, confirm that `.env` remains
 ignored by Git. Keep `ORDER_EXECUTION_ENABLED=false` until the order service is
 implemented and deliberately tested.
@@ -134,16 +147,35 @@ implemented and deliberately tested.
 
 ### Phase 3: Binance market-data ingestion
 
-- [ ] Connect to the Binance Testnet WebSocket market stream.
-- [ ] Subscribe to BTCUSDT and ETHUSDT initially.
-- [ ] Normalize Binance symbols consistently throughout the application.
-- [ ] Parse and validate every incoming tick.
-- [ ] Maintain the latest tick per symbol in a thread-safe in-memory store.
-- [ ] Support adding and removing active symbols without restarting the app.
-- [ ] Add automatic reconnection with exponential backoff.
-- [ ] Detect stale connections and restart subscriptions when necessary.
-- [ ] Handle malformed messages without stopping the stream.
-- [ ] Shut down sockets and background tasks cleanly.
+- [x] Connect to the Binance Testnet WebSocket market stream.
+- [x] Subscribe to BTCUSDT and ETHUSDT initially.
+- [x] Normalize Binance symbols consistently throughout the application.
+- [x] Parse and validate every incoming tick.
+- [x] Maintain the latest tick per symbol in a concurrency-safe in-memory store.
+- [x] Support adding and removing active symbols without restarting the app.
+- [x] Add automatic reconnection with exponential backoff.
+- [x] Detect stale connections and restart subscriptions when necessary.
+- [x] Handle malformed messages without stopping the stream.
+- [x] Shut down sockets and background tasks cleanly.
+
+Implementation notes:
+
+- The client uses Binance Spot's public raw stream endpoint and dynamically
+  sends `SUBSCRIBE` and `UNSUBSCRIBE` messages for `<symbol>@ticker`.
+- The displayed price is Binance's official last-trade price field (`c`), with
+  its corresponding last quantity (`Q`) and exchange event timestamp (`E`).
+- Public production market data is read-only and requires no API credentials.
+  All future order placement remains restricted to Binance Spot Testnet.
+- Binance symbols are lowercased only in stream names; internal symbols remain
+  normalized uppercase values.
+- The WebSocket library handles protocol ping/pong frames, while an application
+  stale timeout forces reconnection when no messages arrive.
+- Control messages are rate-limited, and the configured subscription count is
+  capped at Binance's documented maximum of 1,024 streams per connection.
+- Connections are expected to be recycled by Binance after 24 hours, so every
+  disconnect re-enters the bounded exponential-backoff loop and resubscribes.
+- Invalid JSON, unrelated event types, malformed trades, and downstream tick
+  handler failures are logged without terminating ingestion.
 
 ### Phase 4: One-minute OHLC candle aggregation
 
@@ -159,15 +191,16 @@ implemented and deliberately tested.
 
 ### Phase 5: REST and custom WebSocket API
 
-- [ ] Add a health endpoint showing service and Binance connection status.
-- [ ] Add an endpoint listing active symbols.
-- [ ] Add endpoints to add and remove symbols safely.
-- [ ] Add an endpoint returning the latest tick for each symbol.
+- [x] Add a health endpoint showing service and Binance connection status.
+- [x] Add an endpoint listing active symbols.
+- [x] Add endpoints to add and remove symbols safely.
+- [x] Add an endpoint returning the latest tick for each symbol.
 - [ ] Add an endpoint returning current and historical candles.
 - [ ] Add endpoints returning signals, positions, and trade history.
-- [ ] Replace the placeholder dashboard response with real application state.
-- [ ] Add a custom WebSocket endpoint for live candle updates.
-- [ ] Remove disconnected WebSocket clients without interrupting ingestion.
+- [x] Replace the placeholder dashboard response with real application state.
+- [ ] Add a custom WebSocket endpoint for live candle updates. A live tick
+      endpoint is available now at `/ws/ticks`; candle events belong to Phase 4.
+- [x] Remove disconnected WebSocket clients without interrupting ingestion.
 - [ ] Add request validation, useful HTTP errors, and basic API documentation.
 
 Proposed endpoints:
@@ -245,19 +278,40 @@ B = 15%, while keeping both values configurable.
 
 ### Phase 10: JavaScript frontend
 
-- [ ] Build a clear dashboard layout.
-- [ ] Show backend and Binance connection status.
-- [ ] Show active symbols and controls for adding/removing them.
-- [ ] Display the latest price and timestamp for each symbol.
+- [x] Build a clear dashboard layout.
+- [x] Show backend and Binance connection status.
+- [x] Show active symbols and controls for adding/removing them.
+- [x] Display the latest price and timestamp for each symbol.
 - [ ] Display recent one-minute OHLC candles.
 - [ ] Add candlestick or line charts.
-- [ ] Connect to the backend WebSocket for live candle updates.
-- [ ] Automatically reconnect the frontend WebSocket after disconnection.
+- [ ] Connect to the backend WebSocket for live candle updates. Live tick
+      streaming is connected; candle streaming will be added in Phase 4.
+- [x] Automatically reconnect the frontend WebSocket after disconnection.
 - [ ] Display current strategy signals and indicator values.
 - [ ] Display Variant A and Variant B positions and P&L separately.
 - [ ] Display the trade log and execution status.
-- [ ] Show loading, empty, disconnected, and error states.
-- [ ] Move the backend URL into frontend configuration.
+- [x] Show loading, empty, disconnected, and error states.
+- [x] Remove the hard-coded backend host by using same-origin API URLs and
+      browser-safe configuration from `/api/config`.
+
+### Current dashboard
+
+Start the backend and open `http://127.0.0.1:8000/dashboard/`. The backend
+serves the JavaScript application, which obtains all data through REST and
+WebSocket APIs. Binance credentials remain exclusively on the backend and are
+never included in browser responses.
+
+Current complexity characteristics:
+
+- Latest tick update and single-symbol lookup: expected O(1) dictionary access.
+- Symbol membership, addition, and removal: expected O(1) set operations.
+- WebSocket client registration and removal: expected O(1) set operations.
+- Listing all symbols or ticks: O(n), because every requested item must be
+  serialized and returned.
+- Broadcasting a tick: O(c), where c is the number of connected browser clients.
+- High-frequency updates are coalesced by symbol every configured 100 ms, and
+  the browser updates only changed cards on its next animation frame instead of
+  rebuilding the complete price grid.
 
 ### Phase 11: Testing
 

@@ -7,10 +7,39 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <header>
+      <div>
+        <p id="market-data-label" class="eyebrow">Binance Spot Live Market Data</p>
+        <h1 id="app-title">Crypto Trading System</h1>
+      </div>
+      <div id="connection-badge" class="badge offline">Connecting</div>
+    </header>
+
     <main>
-      <h1>Crypto Trading System</h1>
-      <p id="status">Connecting to the backend...</p>
-      <pre id="dashboard"></pre>
+      <section class="summary-grid">
+        <article class="card"><span>Market stream</span><strong id="stream-state">Waiting</strong></article>
+        <article class="card"><span>Active symbols</span><strong id="symbol-count">0</strong></article>
+        <article class="card"><span>Latest update</span><strong id="last-update">--</strong></article>
+        <article class="card"><span>Order execution</span><strong id="order-state">Disabled</strong></article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Live market data</p><h2>Latest ticks</h2></div>
+          <form id="symbol-form">
+            <input id="symbol-input" aria-label="Trading symbol" placeholder="e.g. BNBUSDT" required />
+            <button type="submit">Add symbol</button>
+          </form>
+        </div>
+        <p id="message" role="status"></p>
+        <div id="tick-grid" class="tick-grid"></div>
+      </section>
+
+      <section class="panel">
+        <p class="eyebrow">Implementation progress</p>
+        <h2>System roadmap</h2>
+        <div id="feature-grid" class="feature-grid"></div>
+      </section>
     </main>
     <script src="app.js"></script>
   </body>
