@@ -1,8 +1,13 @@
 import unittest
+import tempfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
 
 from models import Candle
+from config import get_settings
+from services.order_service import OrderService
 from services.strategy_service import StrategyService
 
 
@@ -25,3 +30,27 @@ class StrategyTests(unittest.IsolatedAsyncioTestCase):
         service = StrategyService(2, 3, 20, 20)
         item = candle(0, "10").model_copy(update={"is_final": False})
         self.assertEqual(await service.process_candle(item), ())
+
+    async def test_finalized_crossover_places_two_variant_orders_with_audit_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = get_settings().model_copy(update={"state_database_path": str(Path(directory) / "state.db")})
+            orders = OrderService(settings)
+            orders._user_sessions[7] = SimpleNamespace(verified=True, enabled=True)
+            submitted = []
+
+            async def place_order(params, test=False):
+                submitted.append(params)
+                return {"executedQty": params["quantity"], "cummulativeQuoteQty": "8"}
+
+            orders.place_order = place_order
+
+            async def execute(signal):
+                await orders.process_signal_for_user(7, signal)
+
+            strategy = StrategyService(2, 3, 20, 20, execute)
+            for index, close in enumerate(("10", "9", "8", "12", "13")):
+                await strategy.process_candle(candle(index, close))
+
+            self.assertEqual(len(submitted), 2)
+            self.assertEqual({item["_audit"]["strategy_variant"] for item in submitted}, {"A", "B"})
+            self.assertTrue(all(item["_audit"]["source"] == "strategy" for item in submitted))

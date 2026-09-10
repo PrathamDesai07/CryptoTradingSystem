@@ -23,9 +23,9 @@ cors_allow_headers:
 
 binance_api_key: ${BINANCE_API_KEY:-}
 binance_api_secret: ${BINANCE_API_SECRET:-}
-binance_testnet_rest_url: https://demo-api.binance.com
-binance_market_rest_url: https://api.binance.com
-binance_market_ws_url: wss://stream.binance.com/stream
+binance_testnet_rest_url: https://testnet.binance.vision
+binance_market_rest_url: https://testnet.binance.vision
+binance_market_ws_url: wss://stream.testnet.binance.vision/stream
 
 trading_symbols: BTCUSDT,ETHUSDT
 market_data_enabled: true

@@ -20,6 +20,8 @@ from pydantic import SecretStr
 from config import Settings
 from models import ExitReason, Position, PositionStatus, Signal, SignalAction, StrategyVariant, Tick
 from services.state_repository import StateRepository
+from services.pretrade_risk import PreTradeRiskEngine, PreTradeRiskError
+from services.reconciliation_service import ReconciliationService
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,7 @@ logger = logging.getLogger(__name__)
 # strategy/risk tasks run without a bound user and keep using process-level
 # credentials, exactly as before multi-user support.
 current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
+PositionKey = tuple[int | None, str, StrategyVariant]
 
 
 class _UserSession:
@@ -44,10 +47,11 @@ class _UserSession:
 class BinanceOrderError(RuntimeError):
     """A credential-free Binance API error safe to return to clients."""
 
-    def __init__(self, message: str, status_code: int = 502, code: int | None = None) -> None:
+    def __init__(self, message: str, status_code: int = 502, code: int | None = None, uncertain: bool = False) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.uncertain = uncertain
 
 
 class OrderService:
@@ -63,16 +67,17 @@ class OrderService:
         "OPOCO": "/api/v3/orderList/opoco",
     }
 
-    def __init__(self, settings: Settings, repository: Any | None = None) -> None:
+    def __init__(self, settings: Settings, repository: Any | None = None, risk_engine: PreTradeRiskEngine | None = None, reconciliation_service: ReconciliationService | None = None) -> None:
         self._settings = settings
-        self._positions: dict[tuple[str, StrategyVariant], Position] = {}
-        self._position_users: dict[tuple[str, StrategyVariant], int] = {}
+        self._positions: dict[PositionKey, Position] = {}
+        self._strategy_enabled_users: dict[int, bool] = {}
+        self._strategy_status: dict[int, dict[str, Any]] = {}
         self._orders: dict[str, dict[str, Any]] = {}
         self._history: deque[dict[str, Any]] = deque(maxlen=settings.strategy_signal_history_size)
         self._symbol_rules: dict[str, dict[str, Any]] = {}
         self._exchange_info_loaded_at: dict[str, float] = {}
         self._lock = asyncio.Lock()
-        self._inflight: set[tuple[str, StrategyVariant]] = set()
+        self._inflight: set[PositionKey] = set()
         self._runtime_api_key: SecretStr | None = None
         self._runtime_api_secret: SecretStr | None = None
         self._session_execution_enabled = False
@@ -80,13 +85,18 @@ class OrderService:
         self._strategy_order_quantity = Decimal(str(settings.strategy_order_quantity))
         self._squared_orders: set[tuple[str, int]] = set()
         self._repository = repository or StateRepository(settings.state_database_path, settings.strategy_signal_history_size)
+        self._risk = risk_engine or PreTradeRiskEngine(Decimal(str(settings.max_order_balance_utilization_percent)))
+        self._reconciliation = reconciliation_service or ReconciliationService()
         for record in self._repository.load_orders():
             self._history.append(record)
             client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
             if client_id:
                 self._orders[client_id] = record
         for position in self._repository.load_positions():
-            self._positions[(position.symbol, position.variant)] = position
+            self._positions[(None, position.symbol, position.variant)] = position
+        if hasattr(self._repository, "load_user_positions"):
+            for user_id, position in self._repository.load_user_positions():
+                self._positions[(user_id, position.symbol, position.variant)] = position
 
     @property
     def execution_enabled(self) -> bool:
@@ -173,6 +183,8 @@ class OrderService:
         if not api_key.strip() or not api_secret.strip():
             raise BinanceOrderError("API key and secret are required", 422)
         self._user_sessions[user_id] = _UserSession(SecretStr(api_key.strip()), SecretStr(api_secret.strip()))
+        if user_id not in self._strategy_enabled_users:
+            self._strategy_enabled_users[user_id] = self._repository.get_user_strategy_enabled(user_id) if hasattr(self._repository, "get_user_strategy_enabled") else True
         token = current_user_id.set(user_id)
         try:
             try:
@@ -200,7 +212,16 @@ class OrderService:
 
     def active_strategy_user_ids(self) -> tuple[int, ...]:
         """Users whose verified Demo sessions can receive automatic orders."""
-        return tuple(user_id for user_id, session in self._user_sessions.items() if session.verified and session.enabled)
+        return tuple(user_id for user_id, session in self._user_sessions.items() if session.verified and session.enabled and self._strategy_enabled_users.get(user_id, True))
+
+    def strategy_status(self, user_id: int) -> dict[str, Any]:
+        return {"enabled": self._strategy_enabled_users.get(user_id, True), "last_event": self._strategy_status.get(user_id)}
+
+    def set_strategy_enabled(self, user_id: int, enabled: bool) -> dict[str, Any]:
+        self._strategy_enabled_users[user_id] = enabled
+        if hasattr(self._repository, "set_user_strategy_enabled"):
+            self._repository.set_user_strategy_enabled(user_id, enabled)
+        return self.strategy_status(user_id)
 
     def _user_execution_enabled(self, user_id: int | None) -> bool:
         if user_id is None:
@@ -212,6 +233,7 @@ class OrderService:
         """Execute one background strategy signal with the user's credentials."""
         token = current_user_id.set(user_id)
         try:
+            self._strategy_status[user_id] = {"state": "received", "symbol": signal.symbol, "variant": signal.variant.value, "action": signal.action.value, "timestamp": signal.timestamp.isoformat(), "error": None}
             await self.process_signal(signal)
         finally:
             current_user_id.reset(token)
@@ -224,8 +246,9 @@ class OrderService:
         return await self.orders(symbol, limit)
 
     async def positions(self, symbol: str | None = None) -> tuple[Position, ...]:
+        user_id = current_user_id.get()
         async with self._lock:
-            return tuple(p.model_copy(deep=True) for (s, _), p in self._positions.items() if symbol is None or s == symbol)
+            return tuple(p.model_copy(deep=True) for (owner, item_symbol, _), p in self._positions.items() if owner == user_id and (symbol is None or item_symbol == symbol))
 
     async def orders(self, symbol: str | None = None, limit: int = 100) -> tuple[dict[str, Any], ...]:
         async with self._lock:
@@ -235,7 +258,7 @@ class OrderService:
     async def process_signal(self, signal: Signal) -> None:
         if not self.execution_enabled:
             return
-        key = (signal.symbol, signal.variant)
+        key: PositionKey = (current_user_id.get(), signal.symbol, signal.variant)
         async with self._lock:
             position = self._positions.get(key)
             if key in self._inflight:
@@ -250,40 +273,47 @@ class OrderService:
                 await self._enter(signal)
             else:
                 await self._exit(key, signal.price, signal.timestamp, ExitReason.SIGNAL)
-        except BinanceOrderError:
+        except BinanceOrderError as error:
+            user_id = current_user_id.get()
+            if user_id is not None:
+                self._strategy_status[user_id] = {**self._strategy_status.get(user_id, {}), "state": "failed", "error": str(error), "updated_at": datetime.now(UTC).isoformat()}
             logger.exception("strategy_order_failed symbol=%s variant=%s", signal.symbol, signal.variant)
+        else:
+            user_id = current_user_id.get()
+            if user_id is not None:
+                self._strategy_status[user_id] = {**self._strategy_status.get(user_id, {}), "state": "processed", "error": None, "updated_at": datetime.now(UTC).isoformat()}
         finally:
             async with self._lock:
                 self._inflight.discard(key)
 
     async def process_tick(self, tick: Tick) -> None:
-        exits: list[tuple[tuple[str, StrategyVariant], ExitReason, int | None]] = []
+        exits: list[tuple[PositionKey, ExitReason]] = []
         async with self._lock:
-            for variant in StrategyVariant:
-                key = (tick.symbol, variant)
-                position = self._positions.get(key)
+            for key, position in tuple(self._positions.items()):
+                owner_id, symbol, _ = key
+                if symbol != tick.symbol:
+                    continue
                 if not position or position.status is not PositionStatus.OPEN:
                     continue
                 position.current_price = tick.price
                 position.current_pnl = (tick.price - position.entry_price) * position.quantity
-                owner_id = self._position_users.get(key)
                 if self._user_execution_enabled(owner_id) and key not in self._inflight:
                     reason = ExitReason.STOP_LOSS if tick.price <= position.stop_loss_price else ExitReason.TAKE_PROFIT if tick.price >= position.take_profit_price else None
                     if reason:
                         self._inflight.add(key)
-                        exits.append((key, reason, self._position_users.get(key)))
-        for key, reason, user_id in exits:
+                        exits.append((key, reason))
+        for key, reason in exits:
             asyncio.create_task(
-                self._execute_risk_exit(key, tick.price, tick.timestamp, reason, user_id),
-                name=f"risk-exit-{key[0]}-{key[1].value}",
+                self._execute_risk_exit(key, tick.price, tick.timestamp, reason),
+                name=f"risk-exit-{key[0]}-{key[1]}-{key[2].value}",
             )
 
-    async def _execute_risk_exit(self, key: tuple[str, StrategyVariant], price: Decimal, timestamp: datetime, reason: ExitReason, user_id: int | None = None) -> None:
-        token = current_user_id.set(user_id)
+    async def _execute_risk_exit(self, key: PositionKey, price: Decimal, timestamp: datetime, reason: ExitReason) -> None:
+        token = current_user_id.set(key[0])
         try:
             await self._exit(key, price, timestamp, reason)
         except BinanceOrderError:
-            logger.exception("risk_exit_failed symbol=%s variant=%s", *key)
+            logger.exception("risk_exit_failed user=%s symbol=%s variant=%s", *key)
         finally:
             current_user_id.reset(token)
             async with self._lock:
@@ -292,42 +322,49 @@ class OrderService:
     async def place_order(self, params: dict[str, Any], test: bool = False) -> dict[str, Any]:
         if not test and not self.execution_enabled:
             raise BinanceOrderError("order execution is disabled by the global kill switch", 409)
-        normalized = await self._normalize_order(params)
+        clean = params.copy()
+        audit = clean.pop("_audit", {})
+        normalized = await self._normalize_order(clean)
+        reservation = None
         if not test:
-            await self._check_balance_utilization(normalized)
-        response = await self._signed_request("POST", "/api/v3/order/test" if test else "/api/v3/order", normalized)
+            try:
+                reservation = await self._risk.reserve(current_user_id.get(), normalized, await self._rules(normalized["symbol"]), self.account, self._market_price)
+            except PreTradeRiskError as error:
+                raise BinanceOrderError(str(error), 422) from error
+        try:
+            response = await self._signed_request("POST", "/api/v3/order/test" if test else "/api/v3/order", normalized)
+        except BinanceOrderError as error:
+            if not test and error.uncertain:
+                await self._risk.mark_uncertain(reservation)
+                reconciled = await self._reconciliation.reconcile_unknown(normalized, self._query_by_client_id)
+                if reconciled is None:
+                    raise BinanceOrderError("order outcome remains unknown after reconciliation; capital reservation retained", 503, uncertain=True) from error
+                response = reconciled
+                await self._risk.release(reservation)
+            else:
+                await self._risk.release(reservation)
+                raise
+        else:
+            await self._risk.release(reservation)
         if not test:
-            await self._record(response, normalized)
+            await self._record(response, normalized, audit if isinstance(audit, dict) else {})
         return response
 
     async def _check_balance_utilization(self, order: dict[str, str]) -> None:
-        """Limit risk-increasing BUY orders; always permit exposure-reducing SELLs."""
-        if order.get("side") != "BUY":
-            return
-        rules = await self._rules(order["symbol"])
-        quote_asset = str(rules.get("_quoteAsset") or "USDT")
-        if "quoteOrderQty" in order:
-            required = Decimal(order["quoteOrderQty"])
-        else:
-            price = Decimal(order["price"]) if "price" in order else Decimal(0)
-            if price <= 0:
-                ticker = await self._public_request("GET", "/api/v3/ticker/price", {"symbol": order["symbol"]})
-                price = Decimal(str(ticker.get("price", "0")))
-            required = Decimal(order.get("quantity", "0")) * price
-        if required <= 0:
-            raise BinanceOrderError("unable to calculate order balance utilization", 422)
-        account = await self.account()
-        balance = next((item for item in account.get("balances", []) if item.get("asset") == quote_asset), None)
-        free = Decimal(str(balance.get("free", "0"))) if balance else Decimal(0)
-        if free <= 0:
-            raise BinanceOrderError(f"no free {quote_asset} balance is available", 422)
-        utilization = required / free * Decimal(100)
-        maximum = Decimal(str(self._settings.max_order_balance_utilization_percent))
-        if utilization > maximum:
-            raise BinanceOrderError(
-                f"risk guard rejected order: {utilization:.2f}% of free {quote_asset} would be used (maximum {maximum:.2f}%)",
-                422,
-            )
+        """Compatibility wrapper used by focused risk tests."""
+        try:
+            reservation = await self._risk.reserve(current_user_id.get(), order, await self._rules(order["symbol"]), self.account, self._market_price)
+        except PreTradeRiskError as error:
+            raise BinanceOrderError(str(error), 422) from error
+        await self._risk.release(reservation)
+
+    async def _market_price(self, symbol: str) -> Decimal:
+        ticker = await self._public_request("GET", "/api/v3/ticker/price", {"symbol": symbol})
+        return Decimal(str(ticker.get("price", "0")))
+
+    async def _query_by_client_id(self, symbol: str, client_id: str) -> dict[str, Any]:
+        result = await self._signed_request("GET", "/api/v3/order", {"symbol": symbol, "origClientOrderId": client_id})
+        return result if isinstance(result, dict) else {}
 
     async def query_order(self, symbol: str, order_id: int | None, client_id: str | None) -> dict[str, Any]:
         params = self._order_reference(symbol, order_id, client_id)
@@ -523,7 +560,7 @@ class OrderService:
     async def square_off(self, symbol: str, variant: StrategyVariant) -> None:
         if not self.execution_enabled:
             raise BinanceOrderError("order execution is disabled by the global kill switch", 409)
-        key = (symbol, variant)
+        key: PositionKey = (current_user_id.get(), symbol, variant)
         async with self._lock:
             position = self._positions.get(key)
             if not position or position.status is not PositionStatus.OPEN:
@@ -541,27 +578,29 @@ class OrderService:
     async def _enter(self, signal: Signal) -> None:
         async with self._lock:
             quantity = self._strategy_order_quantity
-        response = await self.place_order({"symbol": signal.symbol, "side": "BUY", "type": "MARKET", "quantity": str(quantity), "newClientOrderId": self._client_id(signal, "B"), "newOrderRespType": "FULL"})
+        response = await self.place_order({"symbol": signal.symbol, "side": "BUY", "type": "MARKET", "quantity": str(quantity), "newClientOrderId": self._client_id(signal, "B"), "newOrderRespType": "FULL", "_audit": {"source": "strategy", "strategy_variant": signal.variant.value, "signal_reason": signal.reason, "signal_action": signal.action.value}})
         quantity, price = self._execution(response, signal.price)
         if quantity <= 0:
             return
         stop = self._settings.variant_a_stop_loss_percent if signal.variant is StrategyVariant.A else self._settings.variant_b_stop_loss_percent
         position = Position(symbol=signal.symbol, variant=signal.variant, status=PositionStatus.OPEN, quantity=quantity, entry_price=price, current_price=price, current_pnl=Decimal(0), stop_loss_price=price * (Decimal(1) - Decimal(str(stop)) / 100), take_profit_price=price * (Decimal(1) + Decimal(str(self._settings.take_profit_percent)) / 100), opened_at=signal.timestamp)
         async with self._lock:
-            self._positions[(signal.symbol, signal.variant)] = position
             user_id = current_user_id.get()
-            if user_id is not None:
-                self._position_users[(signal.symbol, signal.variant)] = user_id
-            self._repository.save_position(position)
+            self._positions[(user_id, signal.symbol, signal.variant)] = position
+            if user_id is not None and hasattr(self._repository, "save_user_position"):
+                self._repository.save_user_position(user_id, position)
+            else:
+                self._repository.save_position(position)
 
-    async def _exit(self, key: tuple[str, StrategyVariant], fallback: Decimal, timestamp: datetime, reason: ExitReason) -> None:
+    async def _exit(self, key: PositionKey, fallback: Decimal, timestamp: datetime, reason: ExitReason) -> None:
         async with self._lock:
             position = self._positions.get(key)
             if not position or position.status is not PositionStatus.OPEN:
                 return
             quantity = position.quantity
-        sell_quantity = await self._sellable_quantity(key[0], quantity)
-        response = await self.place_order({"symbol": key[0], "side": "SELL", "type": "MARKET", "quantity": str(sell_quantity), "newClientOrderId": f"cts{key[1].value}{key[0]}S{int(timestamp.timestamp())}"[:36], "newOrderRespType": "FULL"})
+        _, symbol, variant = key
+        sell_quantity = await self._sellable_quantity(symbol, quantity)
+        response = await self.place_order({"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(sell_quantity), "newClientOrderId": f"cts{variant.value}{symbol}S{int(timestamp.timestamp())}"[:36], "newOrderRespType": "FULL", "_audit": {"source": "strategy", "strategy_variant": variant.value, "exit_reason": reason.value}})
         executed, price = self._execution(response, fallback)
         if executed <= 0:
             return
@@ -578,9 +617,12 @@ class OrderService:
                     closed_at=None if remaining > 0 else timestamp,
                 )
                 self._positions[key] = Position.model_validate(updated)
-                self._repository.save_position(self._positions[key])
+                if key[0] is not None and hasattr(self._repository, "save_user_position"):
+                    self._repository.save_user_position(key[0], self._positions[key])
+                else:
+                    self._repository.save_position(self._positions[key])
             if self._history:
-                self._history[-1].update(exit_reason=reason.value, strategy_variant=key[1].value)
+                self._history[-1].update(exit_reason=reason.value, strategy_variant=variant.value)
 
     async def _sellable_quantity(self, symbol: str, requested: Decimal) -> Decimal:
         """Return the spendable base quantity accepted by Binance market filters.
@@ -688,14 +730,14 @@ class OrderService:
             raise BinanceOrderError("symbol is not available on Binance Demo Mode", 422)
         return self._symbol_rules[symbol]
 
-    async def _record(self, response: dict[str, Any], request_params: dict[str, Any]) -> None:
-        record = {**request_params, **response, "recordedAt": datetime.now(UTC).isoformat()}
+    async def _record(self, response: dict[str, Any], request_params: dict[str, Any], audit: dict[str, Any] | None = None) -> None:
+        record = {**request_params, **(audit or {}), **response, "recordedAt": datetime.now(UTC).isoformat()}
         user_id = current_user_id.get()
         if user_id is not None:
             # A signed-in account: persist a queryable audit row (status, price,
             # quantity, timestamps) without touching the process-global history.
             if hasattr(self._repository, "log_user_order"):
-                self._repository.log_user_order(user_id, record)
+                self._repository.log_user_order(user_id, record, str(record.get("source") or "manual"))
             return
         client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
         async with self._lock:
@@ -724,7 +766,8 @@ class OrderService:
             )
         except TimeoutError as error:
             raise BinanceOrderError(
-                "Binance did not respond in time; check order status before retrying"
+                "Binance did not respond in time; reconciling by client order ID",
+                uncertain=True,
             ) from error
 
     def _request_sync(self, method: str, path: str, query: str, api_key: str | None) -> Any:
@@ -746,7 +789,7 @@ class OrderService:
                 payload = {}
             raise BinanceOrderError(str(payload.get("msg", "Binance rejected the request")), error.code, payload.get("code")) from error
         except (URLError, TimeoutError) as error:
-            raise BinanceOrderError("Binance request failed; reconcile by client order ID before retrying") from error
+            raise BinanceOrderError("Binance request failed; reconcile by client order ID before retrying", uncertain=True) from error
 
     def _api_key(self) -> str:
         user_id = current_user_id.get()

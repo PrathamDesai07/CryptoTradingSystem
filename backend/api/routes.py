@@ -67,6 +67,10 @@ class StrategyOrderQuantityRequest(BaseModel):
     quantity: Decimal
 
 
+class StrategyEnabledRequest(BaseModel):
+    enabled: bool
+
+
 class OrderListRequest(BaseModel):
     type: str
     parameters: dict[str, object]
@@ -110,7 +114,7 @@ async def public_config(request: Request) -> dict[str, object]:
 
 @router.put("/strategy/order-quantity")
 async def update_strategy_order_quantity(
-    payload: StrategyOrderQuantityRequest, request: Request
+    payload: StrategyOrderQuantityRequest, request: Request, user: dict[str, object] = Depends(require_user)
 ) -> dict[str, object]:
     """Change sizing for future automatic strategy orders in this process."""
     try:
@@ -120,6 +124,16 @@ async def update_strategy_order_quantity(
     except BinanceOrderError as error:
         raise order_error(error) from error
     return {"quantity": quantity, "persistence": "until_backend_restart"}
+
+
+@router.get("/strategy/status")
+async def strategy_status(request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+    return request.app.state.order_service.strategy_status(int(user["id"]))
+
+
+@router.put("/strategy/status")
+async def update_strategy_status(payload: StrategyEnabledRequest, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+    return request.app.state.order_service.set_strategy_enabled(int(user["id"]), payload.enabled)
 
 
 @router.get("/symbols")

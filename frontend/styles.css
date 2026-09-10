@@ -91,6 +91,9 @@ button.secondary.active { color: #f1c40f; border-color: #f1c40f; background: rgb
 .strategy-quantity input { width: 92px; border: 0; padding: 3px 2px; background: transparent; color: var(--text); font: inherit; font-variant-numeric: tabular-nums; outline: none; }
 .strategy-quantity strong { color: #b8c5d6; font-size: .67rem; }
 .strategy-quantity-status { min-width: 36px; color: var(--accent); font-size: .66rem; white-space: nowrap; }
+.strategy-runtime-status { max-width:280px; overflow:hidden; color:var(--muted); font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
+.strategy-runtime-status.error { color:var(--danger); }
+.chart-tool.strategy-live.active { color:var(--accent); border-color:rgba(14,203,129,.35); background:rgba(14,203,129,.07); }
 .toolbar-label { flex: 0 0 auto; margin-right: 3px; color: #75849a; font-size: .76rem; }
 .timeframe-options { display: flex; align-self: stretch; gap: 1px; }
 .timeframe-button, .chart-tool { position: relative; border: 0; border-radius: 5px; padding: 6px 8px; background: transparent; color: #75849a; font-size: .76rem; font-weight: 650; white-space: nowrap; }

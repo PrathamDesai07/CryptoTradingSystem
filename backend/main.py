@@ -4,6 +4,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -22,6 +23,8 @@ from services import (
     DatabaseHandler,
     OrderBookStore,
     OrderService,
+    PreTradeRiskEngine,
+    ReconciliationService,
     StrategyService,
     TickBroadcaster,
     TickStore,
@@ -38,7 +41,14 @@ db_handler = DatabaseHandler(
     settings.strategy_signal_history_size,
     master_key=settings.credentials_master_key.get_secret_value() if settings.credentials_master_key else None,
 )
-order_service = OrderService(settings, repository=db_handler)
+risk_engine = PreTradeRiskEngine(Decimal(str(settings.max_order_balance_utilization_percent)))
+reconciliation_service = ReconciliationService()
+order_service = OrderService(
+    settings,
+    repository=db_handler,
+    risk_engine=risk_engine,
+    reconciliation_service=reconciliation_service,
+)
 
 
 async def handle_signal(signal: Signal) -> None:

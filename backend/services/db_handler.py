@@ -91,6 +91,8 @@ class DatabaseHandler:
             db.execute("CREATE TABLE IF NOT EXISTS user_credentials (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, api_key_enc TEXT NOT NULL, api_secret_enc TEXT NOT NULL, last_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+            db.execute("CREATE TABLE IF NOT EXISTS user_strategy_settings (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS user_positions (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, symbol TEXT NOT NULL, variant TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, symbol, variant))")
             db.execute("""CREATE TABLE IF NOT EXISTS order_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -234,6 +236,30 @@ class DatabaseHandler:
     def delete_user_sessions(self, user_id: int) -> None:
         with closing(self._connect()) as db, db:
             db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+
+    def get_user_strategy_enabled(self, user_id: int) -> bool:
+        with closing(self._connect()) as db:
+            row = db.execute("SELECT enabled FROM user_strategy_settings WHERE user_id = ?", (user_id,)).fetchone()
+        return True if row is None else bool(row[0])
+
+    def set_user_strategy_enabled(self, user_id: int, enabled: bool) -> None:
+        with closing(self._connect()) as db, db:
+            db.execute(
+                "INSERT INTO user_strategy_settings(user_id, enabled, updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at",
+                (user_id, int(enabled), _now()),
+            )
+
+    def load_user_positions(self) -> list[tuple[int, Position]]:
+        with closing(self._connect()) as db:
+            rows = db.execute("SELECT user_id, payload FROM user_positions").fetchall()
+        return [(int(row[0]), Position.model_validate_json(row[1])) for row in rows]
+
+    def save_user_position(self, user_id: int, position: Position) -> None:
+        with closing(self._connect()) as db, db:
+            db.execute(
+                "INSERT INTO user_positions(user_id, symbol, variant, payload, updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id, symbol, variant) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
+                (user_id, position.symbol, position.variant.value, position.model_dump_json(), _now()),
+            )
 
     # ------------------------------------------------------------- order audit
     def log_user_order(self, user_id: int, record: dict[str, Any], source: str = "manual") -> None:

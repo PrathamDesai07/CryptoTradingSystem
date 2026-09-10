@@ -8,6 +8,7 @@ from pathlib import Path
 from config import get_settings
 from models import Position, PositionStatus, Signal, SignalAction, StrategyVariant
 from services.order_service import BinanceOrderError, OrderService, current_user_id
+from services.db_handler import DatabaseHandler, hash_password
 from services.state_repository import StateRepository
 
 
@@ -96,7 +97,43 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.service.process_signal_for_user(7, signal)
         self.assertEqual(observed_user_ids, [7])
-        self.assertEqual(self.service._position_users[("BTCUSDT", StrategyVariant.A)], 7)
+        self.assertIn((7, "BTCUSDT", StrategyVariant.A), self.service._positions)
+
+    async def test_two_users_can_hold_same_symbol_and_variant_independently(self):
+        self.service._user_sessions[7] = SimpleNamespace(verified=True, enabled=True)
+        self.service._user_sessions[8] = SimpleNamespace(verified=True, enabled=True)
+
+        async def place_order(params, test=False):
+            return {"executedQty": params["quantity"], "cummulativeQuoteQty": "8"}
+
+        self.service.place_order = place_order
+        signal = Signal(
+            symbol="BTCUSDT", variant=StrategyVariant.A, action=SignalAction.BUY,
+            price=Decimal("40000"), fast_value=Decimal("40100"), slow_value=Decimal("40000"),
+            reason="test crossover", timestamp=datetime.now(UTC),
+        )
+        await self.service.process_signal_for_user(7, signal)
+        await self.service.process_signal_for_user(8, signal)
+        self.assertIn((7, "BTCUSDT", StrategyVariant.A), self.service._positions)
+        self.assertIn((8, "BTCUSDT", StrategyVariant.A), self.service._positions)
+
+    async def test_strategy_audit_metadata_is_persisted_for_user(self):
+        captured = []
+        self.service._repository = SimpleNamespace(
+            log_user_order=lambda user_id, record, source: captured.append((user_id, record, source))
+        )
+        token = current_user_id.set(7)
+        try:
+            await self.service._record(
+                {"orderId": 42, "status": "FILLED", "executedQty": "0.001"},
+                {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET"},
+                {"source": "strategy", "strategy_variant": "A", "signal_reason": "SMA crossed above EMA"},
+            )
+        finally:
+            current_user_id.reset(token)
+        self.assertEqual(captured[0][0], 7)
+        self.assertEqual(captured[0][1]["strategy_variant"], "A")
+        self.assertEqual(captured[0][2], "strategy")
 
     async def test_strategy_quantity_must_be_positive(self):
         with self.assertRaises(BinanceOrderError):
@@ -166,3 +203,13 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         repository.save_position(position)
         self.assertEqual(repository.load_orders()[0]["orderId"], 1)
         self.assertEqual(repository.load_positions()[0].variant, StrategyVariant.A)
+
+    def test_user_position_ownership_survives_restart(self):
+        path = str(Path(self.temp.name) / "users.db")
+        repository = DatabaseHandler(path, 10)
+        user_id = repository.create_user("owner", "Owner", hash_password("secret1"))
+        position = Position(symbol="BTCUSDT", variant=StrategyVariant.A, status=PositionStatus.OPEN, quantity="0.01", entry_price="100", current_price="101", current_pnl="0.01", stop_loss_price="90", take_profit_price="105", opened_at=datetime.now(UTC))
+        repository.save_user_position(user_id, position)
+        restored = repository.load_user_positions()
+        self.assertEqual(restored[0][0], user_id)
+        self.assertEqual(restored[0][1].symbol, "BTCUSDT")

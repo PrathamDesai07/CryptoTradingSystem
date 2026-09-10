@@ -5,6 +5,8 @@ from .market_data import BinanceStreamClient
 from .candle_service import CandleService
 from .order_book_store import OrderBookStore
 from .order_service import BinanceOrderError, OrderService
+from .pretrade_risk import PreTradeRiskEngine
+from .reconciliation_service import ReconciliationService
 from .strategy_service import StrategyService
 from .state_repository import StateRepository
 from .tick_broadcaster import TickBroadcaster
@@ -17,6 +19,8 @@ __all__ = [
     "OrderBookStore",
     "BinanceOrderError",
     "OrderService",
+    "PreTradeRiskEngine",
+    "ReconciliationService",
     "StrategyService",
     "StateRepository",
     "TickBroadcaster",

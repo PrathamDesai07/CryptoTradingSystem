@@ -48,6 +48,7 @@ const state = {
   pnlBasis: null,
   recentOrders: [],
   strategyOrderQuantity: null,
+  strategyEnabled: true,
 };
 const elements = {
   title: document.querySelector("#app-title"),
@@ -120,6 +121,8 @@ const elements = {
   strategyOrderQuantity: document.querySelector("#strategy-order-quantity"),
   strategyOrderAsset: document.querySelector("#strategy-order-asset"),
   strategyQuantityStatus: document.querySelector("#strategy-quantity-status"),
+  strategyToggle: document.querySelector("#strategy-toggle"),
+  strategyRuntimeStatus: document.querySelector("#strategy-runtime-status"),
   authScreen: document.querySelector("#auth-screen"),
   authTabLogin: document.querySelector("#auth-tab-login"),
   authTabSignup: document.querySelector("#auth-tab-signup"),
@@ -335,6 +338,34 @@ async function loadOrderSession() {
   state.orderExecutionEnabled = Boolean(session.execution_enabled);
   renderOrderSession();
 }
+
+async function loadStrategyStatus() {
+  const status = await request("strategy/status");
+  state.strategyEnabled = status.enabled;
+  elements.strategyToggle.textContent = status.enabled ? "Auto trading on" : "Auto trading off";
+  elements.strategyToggle.classList.toggle("active", status.enabled);
+  elements.strategyToggle.setAttribute("aria-pressed", String(status.enabled));
+  const event = status.last_event;
+  elements.strategyRuntimeStatus.classList.toggle("error", Boolean(event?.error));
+  elements.strategyRuntimeStatus.textContent = event?.error
+    ? `Last auto order failed: ${event.error}`
+    : event
+      ? `${event.state}: ${event.action} ${event.symbol} · Variant ${event.variant}`
+      : "Waiting for crossover";
+}
+
+elements.strategyToggle.addEventListener("click", async () => {
+  elements.strategyToggle.disabled = true;
+  try {
+    await request("strategy/status", {method: "PUT", body: JSON.stringify({enabled: !state.strategyEnabled})});
+    await loadStrategyStatus();
+  } catch (error) {
+    elements.strategyRuntimeStatus.textContent = error.message;
+    elements.strategyRuntimeStatus.classList.add("error");
+  } finally {
+    elements.strategyToggle.disabled = false;
+  }
+});
 
 async function loadAccountBalance() {
   const response = await request("account");
@@ -1272,6 +1303,7 @@ async function startDashboard() {
   try {
     await Promise.all([loadPublicConfig(), loadDashboard()]);
     await loadOrderSession();
+    await loadStrategyStatus();
     await loadAccountBalance().catch((error) => {
       elements.accountFreeBalance.textContent = "Unavailable";
       elements.accountInvestedBalance.textContent = "-- USDT";
@@ -1282,6 +1314,7 @@ async function startDashboard() {
     connectSocket();
     window.setInterval(() => loadDashboard().catch(() => setConnection(false)), state.pollSeconds * 1000);
     window.setInterval(() => loadAccountBalance().catch(() => {}), 15000);
+    window.setInterval(() => loadStrategyStatus().catch(() => {}), 10000);
   } catch (error) {
     elements.message.textContent = error.message;
     setConnection(false);

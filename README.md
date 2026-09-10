@@ -42,6 +42,8 @@ backend/
     |-- candle_service.py      # One-minute OHLC aggregation
     |-- strategy_service.py    # SMA/EMA calculations and signals
     |-- order_service.py       # Binance Demo orders, risk, P&L, and order lists
+    |-- pretrade_risk.py       # Atomic per-account capital reservations
+    |-- reconciliation_service.py # Unknown-order reconciliation by client ID
     |-- state_repository.py    # SQLite order/position persistence
     `-- __init__.py
 
@@ -110,10 +112,11 @@ creates a local `.env` from `.env.example` when missing, starts the backend, and
 opens the API-served JavaScript dashboard. The backend and frontend share one
 process, so pressing `Ctrl+C` stops the complete application.
 
-Credentials can be entered in the dashboard when the first order is submitted.
-They are verified against Demo Mode, retained only in backend process memory,
-and cleared at shutdown. `.env` remains supported for unattended local testing
-and is ignored by Git.
+Credentials are collected during account creation and may be replaced from the
+dashboard after password confirmation. They are encrypted in SQLite, verified
+against Binance Spot Testnet, and decrypted only into the signed-in user's
+backend session. `.env` remains supported for unattended local testing and is
+ignored by Git.
 
 #### Configuration behavior
 
@@ -145,7 +148,7 @@ and is ignored by Git.
 
 ### Phase 3: Binance market-data ingestion
 
-- [x] Connect to Binance's public production WebSocket for read-only live prices.
+- [x] Connect to Binance Spot Testnet WebSocket for live prices.
 - [x] Subscribe to BTCUSDT and ETHUSDT initially.
 - [x] Normalize Binance symbols consistently throughout the application.
 - [x] Parse and validate every incoming tick.
@@ -162,8 +165,8 @@ Implementation notes:
   sends `SUBSCRIBE` and `UNSUBSCRIBE` messages for `<symbol>@ticker`.
 - The displayed price is Binance's official last-trade price field (`c`), with
   its corresponding last quantity (`Q`) and exchange event timestamp (`E`).
-- Public production market data is read-only and requires no API credentials.
-  All future order placement remains restricted to Binance Spot Testnet.
+- Testnet public market data requires no API credentials. Signed order
+  placement is restricted to the configured official Spot Testnet host.
 - Binance symbols are lowercased only in stream names; internal symbols remain
   normalized uppercase values.
 - The WebSocket library handles protocol ping/pong frames, while an application
@@ -293,7 +296,7 @@ B = 15%, while keeping both values configurable.
 
 ### Phase 8: Binance Testnet order execution
 
-- [x] Implement HMAC-SHA256 authenticated Binance Demo REST requests.
+- [x] Implement HMAC-SHA256 authenticated Binance Spot Testnet REST requests.
 - [x] Allow only official Spot Testnet or Demo Mode order hosts.
 - [x] Fetch and cache symbol filters such as minimum quantity, step size, and tick size.
 - [x] Normalize configured quantities and prices to exchange filters.
@@ -433,23 +436,23 @@ frame uses the latest data available at that moment.
 ### Phase 12: Documentation and delivery
 
 - [x] Document prerequisites and exact setup commands.
-- [x] Document how to create and use Binance Demo credentials safely.
+- [x] Document how to create and use Binance Spot Testnet credentials safely.
 - [x] Document configuration fields without exposing credentials.
 - [x] Document the strategy, SL/TP calculations, P&L, and assumptions.
 - [x] Document how to start the backend and frontend.
 - [x] Provide example API requests and WebSocket messages.
 - [x] Document known limitations and future improvements.
-- [x] Restrict signed order execution to official Binance Demo/Testnet hosts;
-      the production endpoint is used only for public read-only market data.
+- [x] Restrict market data and signed order execution to official Binance
+      Spot Testnet endpoints by default.
 
-## Demo credentials
+## Testnet credentials
 
-Create a new key from Binance Demo Trading's API Key Management page. Never use
+Create a new key from Binance Spot Testnet's API Key Management page. Never use
 a production key and never paste a secret into source files. The recommended
 flow is to leave `.env` blank, prepare an order in the dashboard, and enter the
-Demo key in the runtime prompt. Successful verification enables trading only
-until the backend stops. Revoke any key disclosed in chat, screenshots, logs,
-or source control immediately.
+Testnet key during account creation. Credentials are encrypted at rest and can
+only be replaced after confirming the account password. Revoke any key disclosed
+in chat, screenshots, logs, or source control immediately.
 
 ## API examples
 
@@ -482,7 +485,8 @@ $env:PYTHONPATH = "backend"
 
 - This is a single-process educational Demo Mode system, not production trading
   infrastructure or financial advice.
-- Runtime credentials intentionally disappear at backend shutdown.
+- User credentials persist encrypted in SQLite; decrypted copies exist only in
+  active backend sessions.
 - Third-asset commissions are reported without historical USDT conversion.
 - SQLite stores audit/strategy state locally; Binance remains authoritative for
   balances, fills, open orders, and order lists.
