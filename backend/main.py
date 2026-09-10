@@ -43,10 +43,18 @@ order_service = OrderService(settings, repository=db_handler)
 
 async def handle_signal(signal: Signal) -> None:
     tick_broadcaster.publish_signal(signal)
-    asyncio.create_task(
-        order_service.process_signal(signal),
-        name=f"strategy-order-{signal.symbol}-{signal.variant.value}",
-    )
+    user_ids = order_service.active_strategy_user_ids()
+    if user_ids:
+        for user_id in user_ids:
+            asyncio.create_task(
+                order_service.process_signal_for_user(user_id, signal),
+                name=f"strategy-order-user-{user_id}-{signal.symbol}-{signal.variant.value}",
+            )
+    else:
+        asyncio.create_task(
+            order_service.process_signal(signal),
+            name=f"strategy-order-{signal.symbol}-{signal.variant.value}",
+        )
 
 
 strategy_service = StrategyService(

@@ -352,11 +352,31 @@ async def pnl(symbol: str, request: Request, user: dict[str, object] = Depends(r
 
 @router.post("/orders/{symbol}/{order_id}/square-off")
 async def square_off_order(symbol: str, order_id: int, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+    normalized = normalize_symbol(symbol)
     try:
-        result = await request.app.state.order_service.square_off_order(normalize_symbol(symbol), order_id)
+        service = request.app.state.order_service
+        result = await service.square_off_order(normalized, order_id)
     except BinanceOrderError as error:
         raise order_error(error) from error
-    return {"order": result}
+    rules = await service._rules(normalized)
+    quote_asset = str(rules.get("_quoteAsset") or "USDT")
+    gross_quote = Decimal(str(result.get("cummulativeQuoteQty", "0")))
+    quote_commission = sum(
+        (
+            Decimal(str(fill.get("commission", "0")))
+            for fill in result.get("fills", [])
+            if fill.get("commissionAsset") == quote_asset
+        ),
+        Decimal(0),
+    )
+    return {
+        "order": result,
+        "settlement": {
+            "base_quantity_sold": Decimal(str(result.get("executedQty", "0"))),
+            "quote_asset": quote_asset,
+            "quote_credited": gross_quote - quote_commission,
+        },
+    }
 
 
 @router.get("/orders")

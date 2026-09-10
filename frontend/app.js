@@ -135,7 +135,19 @@ const elements = {
   userArea: document.querySelector("#user-area"),
   authUser: document.querySelector("#auth-user"),
   logoutButton: document.querySelector("#logout-button"),
+  changeCredentialsButton: document.querySelector("#change-credentials-button"),
+  credentialsSettings: document.querySelector("#credentials-settings"),
+  closeCredentialsSettings: document.querySelector("#close-credentials-settings"),
+  credentialsSettingsForm: document.querySelector("#credentials-settings-form"),
+  credentialsPassword: document.querySelector("#credentials-password"),
+  credentialsApiKey: document.querySelector("#credentials-api-key"),
+  credentialsApiSecret: document.querySelector("#credentials-api-secret"),
+  credentialsSettingsMessage: document.querySelector("#credentials-settings-message"),
   retryStoredCredentials: document.querySelector("#retry-stored-credentials"),
+  accountBalanceStrip: document.querySelector("#account-balance-strip"),
+  accountFreeBalance: document.querySelector("#account-free-balance"),
+  accountInvestedBalance: document.querySelector("#account-invested-balance"),
+  accountUtilization: document.querySelector("#account-utilization"),
 };
 
 async function request(path, options = {}) {
@@ -161,7 +173,15 @@ async function request(path, options = {}) {
   }
   const body = await response.json().catch(() => ({}));
   const detail = typeof body.detail === "object" ? body.detail?.message : body.detail;
-  if (response.status === 401 && token) {
+  const authErrorCode = typeof body.detail === "object" ? body.detail?.code : null;
+  const isApplicationAuthFailure = response.status === 401 && (
+    authErrorCode === "AUTH_REQUIRED"
+    || authErrorCode === "SESSION_EXPIRED"
+    // Backward compatibility while a browser is connected to an older backend.
+    || body.detail === "authentication required"
+    || body.detail === "session is invalid or expired"
+  );
+  if (isApplicationAuthFailure && token) {
     storeAuthToken("");
     showAuthGate("login", "Your session expired. Sign in again.");
   }
@@ -316,6 +336,27 @@ async function loadOrderSession() {
   renderOrderSession();
 }
 
+async function loadAccountBalance() {
+  const response = await request("account");
+  const balances = response.account?.balances || [];
+  const usdt = balances.find((item) => item.asset === "USDT") || { free: "0", locked: "0" };
+  const free = Number(usdt.free || 0);
+  let invested = Number(usdt.locked || 0);
+  for (const balance of balances) {
+    if (balance.asset === "USDT") continue;
+    const quantity = Number(balance.free || 0) + Number(balance.locked || 0);
+    const tick = state.ticks.get(`${balance.asset}USDT`);
+    if (quantity > 0 && tick) invested += quantity * Number(tick.price || 0);
+  }
+  const total = free + invested;
+  const utilization = total > 0 ? invested / total * 100 : 0;
+  elements.accountFreeBalance.textContent = `${formatPrice(free)} USDT`;
+  elements.accountInvestedBalance.textContent = `${formatPrice(invested)} USDT`;
+  elements.accountUtilization.textContent = `${utilization.toFixed(2)}%`;
+  elements.accountUtilization.classList.toggle("warning", utilization >= 80);
+  elements.accountBalanceStrip.hidden = false;
+}
+
 function renderOrderSession() {
   elements.executionWarning.textContent = state.orderExecutionEnabled
     ? "Demo session connected"
@@ -430,6 +471,10 @@ async function selectSymbol(symbol) {
   document.body.classList.add("trading-mode");
   elements.detail.hidden = false;
   elements.detailSymbol.textContent = symbol;
+  elements.detail.querySelector(".market-heading").insertBefore(
+    elements.accountBalanceStrip,
+    elements.detail.querySelector(".detail-actions"),
+  );
   elements.strategyOrderAsset.textContent = symbol.endsWith("USDT")
     ? symbol.slice(0, -4)
     : "units";
@@ -757,6 +802,13 @@ elements.orderForm.addEventListener("submit", async (event) => {
     elements.orderMessage.textContent = `Order ${response.order.orderId || response.order.clientOrderId || "accepted"}: ${response.order.status || "submitted"}`;
     subscribeDepth(state.selectedSymbol);
     await refreshOrderManagement();
+    await loadAccountBalance().catch((error) => {
+      elements.accountFreeBalance.textContent = "Unavailable";
+      elements.accountInvestedBalance.textContent = "-- USDT";
+      elements.accountUtilization.textContent = "--%";
+      elements.accountBalanceStrip.hidden = false;
+      elements.message.textContent = error.message;
+    });
   } catch (error) {
     elements.orderMessage.textContent = error.message;
   } finally {
@@ -902,8 +954,12 @@ elements.recentOrderList.addEventListener("click", async (event) => {
   try {
     const orderId = button.dataset.orderId;
     const response = await request(`orders/${encodeURIComponent(state.selectedSymbol)}/${encodeURIComponent(orderId)}/square-off`, { method: "POST" });
-    elements.orderMessage.textContent = `Square-off order ${response.order.orderId}: ${response.order.status}.`;
+    const settlement = response.settlement;
+    elements.orderMessage.textContent = settlement
+      ? `Square-off filled: sold ${formatQuantity(settlement.base_quantity_sold)} · ${formatPrice(settlement.quote_credited)} ${settlement.quote_asset} credited.`
+      : `Square-off order ${response.order.orderId}: ${response.order.status}.`;
     await refreshOrderManagement();
+    await loadAccountBalance();
   } catch (error) {
     elements.orderMessage.textContent = error.message;
     button.disabled = false;
@@ -1205,6 +1261,7 @@ elements.closeDetail.addEventListener("click", () => {
   clearPendingOrderBook();
   elements.detail.hidden = true;
   document.body.classList.remove("trading-mode");
+  document.querySelector(".header-actions").prepend(elements.accountBalanceStrip);
 });
 
 let dashboardStarted = false;
@@ -1215,8 +1272,16 @@ async function startDashboard() {
   try {
     await Promise.all([loadPublicConfig(), loadDashboard()]);
     await loadOrderSession();
+    await loadAccountBalance().catch((error) => {
+      elements.accountFreeBalance.textContent = "Unavailable";
+      elements.accountInvestedBalance.textContent = "-- USDT";
+      elements.accountUtilization.textContent = "--%";
+      elements.accountBalanceStrip.hidden = false;
+      elements.message.textContent = error.message;
+    });
     connectSocket();
     window.setInterval(() => loadDashboard().catch(() => setConnection(false)), state.pollSeconds * 1000);
+    window.setInterval(() => loadAccountBalance().catch(() => {}), 15000);
   } catch (error) {
     elements.message.textContent = error.message;
     setConnection(false);
@@ -1234,6 +1299,7 @@ function setAuthTab(tab) {
 function showAuthGate(tab = "login", message = "") {
   storeAuthToken("");
   elements.userArea.hidden = true;
+  elements.accountBalanceStrip.hidden = true;
   elements.authMessage.classList.remove("error");
   setAuthTab(tab);
   elements.authMessage.textContent = message;
@@ -1241,8 +1307,8 @@ function showAuthGate(tab = "login", message = "") {
 }
 
 async function enterDashboard(result) {
-  const username = result?.user?.username || "";
-  elements.authUser.textContent = username ? `Signed in as ${username}` : "Signed in";
+  const name = result?.user?.display_name || result?.user?.username || "";
+  elements.authUser.textContent = name || "User";
   elements.authMessage.textContent = "";
   elements.authScreen.hidden = true;
   elements.userArea.hidden = false;
@@ -1294,6 +1360,47 @@ elements.logoutButton.addEventListener("click", async () => {
   }
   storeAuthToken("");
   window.location.reload();
+});
+
+function closeCredentialsSettings() {
+  elements.credentialsSettings.hidden = true;
+  elements.credentialsSettingsForm.reset();
+  elements.credentialsSettingsMessage.textContent = "";
+}
+
+elements.changeCredentialsButton.addEventListener("click", () => {
+  elements.credentialsSettings.hidden = false;
+  elements.credentialsPassword.focus();
+});
+elements.closeCredentialsSettings.addEventListener("click", closeCredentialsSettings);
+elements.credentialsSettings.addEventListener("click", (event) => {
+  if (event.target === elements.credentialsSettings) closeCredentialsSettings();
+});
+elements.credentialsSettingsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const submit = elements.credentialsSettingsForm.querySelector("button[type='submit']");
+  submit.disabled = true;
+  elements.credentialsSettingsMessage.textContent = "Verifying replacement credentials...";
+  try {
+    await request("auth/credentials", {
+      method: "PUT",
+      body: JSON.stringify({
+        password: elements.credentialsPassword.value,
+        api_key: elements.credentialsApiKey.value.trim(),
+        api_secret: elements.credentialsApiSecret.value.trim(),
+      }),
+    });
+    state.credentialsConfigured = true;
+    state.orderExecutionEnabled = true;
+    renderOrderSession();
+    await loadAccountBalance();
+    elements.credentialsSettingsMessage.textContent = "Credentials updated successfully.";
+    window.setTimeout(closeCredentialsSettings, 900);
+  } catch (error) {
+    elements.credentialsSettingsMessage.textContent = error.message;
+  } finally {
+    submit.disabled = false;
+  }
 });
 
 elements.retryStoredCredentials.addEventListener("click", async () => {

@@ -17,7 +17,10 @@ def bearer_token(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token.strip():
-        raise HTTPException(status_code=401, detail="authentication required")
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "AUTH_REQUIRED", "message": "authentication required"},
+        )
     return token.strip()
 
 
@@ -29,6 +32,12 @@ async def require_user(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="database handler is not available")
     user = handler.get_session_user(token)
     if user is None:
-        raise HTTPException(status_code=401, detail="session is invalid or expired")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "SESSION_EXPIRED",
+                "message": "session is invalid or expired",
+            },
+        )
     current_user_id.set(int(user["id"]))
     return user

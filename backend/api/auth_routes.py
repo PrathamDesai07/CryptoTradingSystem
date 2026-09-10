@@ -33,6 +33,12 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class UpdateCredentialsRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+    api_key: str = Field(min_length=1)
+    api_secret: str = Field(min_length=1)
+
+
 async def _activate(db: Any, service: Any, user_id: int, api_key: str, api_secret: str) -> dict[str, Any]:
     """Store encrypted keys, activate the in-memory session and verify online."""
     db.set_user_credentials(user_id, db.encrypt_secret(api_key), db.encrypt_secret(api_secret))
@@ -141,3 +147,44 @@ async def verify_binance(request: Request, user: dict[str, Any] = Depends(requir
     if not status.get("verified") or not status.get("can_trade"):
         raise order_error(BinanceOrderError(status.get("error") or "Binance Demo keys could not be verified", 403))
     return {"connected": True, "verified": True, "storage": "encrypted_database"}
+
+
+@router.put("/auth/credentials")
+async def update_credentials(
+    payload: UpdateCredentialsRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, object]:
+    """Password-confirm and replace this account's Binance Demo credentials."""
+    if not verify_password(payload.password, str(user["password_hash"])):
+        raise HTTPException(status_code=403, detail="incorrect account password")
+
+    db = request.app.state.db_handler
+    service = request.app.state.order_service
+    user_id = int(user["id"])
+    previous = db.get_user_credentials(user_id)
+    api_key, api_secret = payload.api_key.strip(), payload.api_secret.strip()
+    if not api_key or not api_secret:
+        raise HTTPException(status_code=422, detail="API key and secret are required")
+
+    status = await service.connect_user_credentials(user_id, api_key, api_secret)
+    if not status.get("verified") or not status.get("can_trade"):
+        # Do not strand the signed-in account with an invalid replacement.
+        if previous is not None:
+            old_key = db.decrypt_secret(previous["api_key_enc"])
+            old_secret = db.decrypt_secret(previous["api_secret_enc"])
+            await service.connect_user_credentials(user_id, old_key, old_secret)
+        raise order_error(
+            BinanceOrderError(
+                status.get("error") or "the replacement Binance Demo keys could not be verified",
+                422,
+            )
+        )
+
+    db.set_user_credentials(
+        user_id,
+        db.encrypt_secret(api_key),
+        db.encrypt_secret(api_secret),
+    )
+    db.mark_credentials_verified(user_id)
+    return {"updated": True, "verified": True, "execution_enabled": True}

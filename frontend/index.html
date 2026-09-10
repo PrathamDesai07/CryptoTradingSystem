@@ -36,14 +36,23 @@
     </div>
 
     <header>
-      <div>
-        <p id="market-data-label" class="eyebrow">Binance Spot Live Market Data</p>
-        <h1 id="app-title">Crypto Trading System</h1>
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true">CT</span>
+        <div>
+        <p id="market-data-label" class="eyebrow">Binance Spot · Live Market Data</p>
+        <h1 id="app-title">Crypto Trading Terminal</h1>
+        </div>
       </div>
       <div class="header-actions">
+        <aside id="account-balance-strip" class="account-balance-strip" hidden aria-live="polite">
+          <div class="account-metric"><span>Available</span><strong id="account-free-balance">-- USDT</strong></div>
+          <i></i><div class="account-metric"><span>Invested</span><strong id="account-invested-balance">-- USDT</strong></div>
+          <i></i><div class="account-metric"><span>Utilization</span><strong id="account-utilization">--%</strong></div>
+        </aside>
         <div id="connection-badge" class="badge offline">Connecting</div>
         <div id="user-area" hidden>
           <span id="auth-user" class="badge"></span>
+          <button id="change-credentials-button" class="secondary" type="button">API credentials</button>
           <button id="logout-button" class="secondary" type="button">Sign out</button>
         </div>
       </div>
@@ -207,6 +216,23 @@
         <div id="feature-grid" class="feature-grid"></div>
       </section>
     </main>
+
+    <div id="credentials-settings" class="settings-overlay" hidden>
+      <section class="settings-card" role="dialog" aria-modal="true" aria-labelledby="credentials-settings-title">
+        <div class="settings-heading">
+          <div><p class="eyebrow">Account security</p><h2 id="credentials-settings-title">Change API credentials</h2></div>
+          <button id="close-credentials-settings" class="secondary" type="button" aria-label="Close">Close</button>
+        </div>
+        <p class="settings-copy">Enter your account password to replace the Binance Demo credentials. New keys are verified before the saved keys are changed.</p>
+        <form id="credentials-settings-form" class="settings-form" autocomplete="off">
+          <label>Account password<input id="credentials-password" type="password" autocomplete="current-password" required /></label>
+          <label>New Binance Demo API key<input id="credentials-api-key" type="password" autocomplete="off" required /></label>
+          <label>New Binance Demo secret key<input id="credentials-api-secret" type="password" autocomplete="off" required /></label>
+          <button type="submit">Verify and update</button>
+          <p id="credentials-settings-message" class="order-message" role="status"></p>
+        </form>
+      </section>
+    </div>
     <script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="app.js"></script>
   </body>

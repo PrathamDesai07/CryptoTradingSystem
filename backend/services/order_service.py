@@ -66,6 +66,7 @@ class OrderService:
     def __init__(self, settings: Settings, repository: Any | None = None) -> None:
         self._settings = settings
         self._positions: dict[tuple[str, StrategyVariant], Position] = {}
+        self._position_users: dict[tuple[str, StrategyVariant], int] = {}
         self._orders: dict[str, dict[str, Any]] = {}
         self._history: deque[dict[str, Any]] = deque(maxlen=settings.strategy_signal_history_size)
         self._symbol_rules: dict[str, dict[str, Any]] = {}
@@ -197,6 +198,24 @@ class OrderService:
     def has_active_session(self, user_id: int) -> bool:
         return user_id in self._user_sessions
 
+    def active_strategy_user_ids(self) -> tuple[int, ...]:
+        """Users whose verified Demo sessions can receive automatic orders."""
+        return tuple(user_id for user_id, session in self._user_sessions.items() if session.verified and session.enabled)
+
+    def _user_execution_enabled(self, user_id: int | None) -> bool:
+        if user_id is None:
+            return self.execution_enabled
+        session = self._user_sessions.get(user_id)
+        return bool(session and session.verified and session.enabled)
+
+    async def process_signal_for_user(self, user_id: int, signal: Signal) -> None:
+        """Execute one background strategy signal with the user's credentials."""
+        token = current_user_id.set(user_id)
+        try:
+            await self.process_signal(signal)
+        finally:
+            current_user_id.reset(token)
+
     async def order_log(self, symbol: str | None = None, limit: int = 100) -> tuple[dict[str, Any], ...]:
         """Audit rows for the bound user; falls back to legacy history otherwise."""
         user_id = current_user_id.get()
@@ -238,7 +257,7 @@ class OrderService:
                 self._inflight.discard(key)
 
     async def process_tick(self, tick: Tick) -> None:
-        exits: list[tuple[tuple[str, StrategyVariant], ExitReason]] = []
+        exits: list[tuple[tuple[str, StrategyVariant], ExitReason, int | None]] = []
         async with self._lock:
             for variant in StrategyVariant:
                 key = (tick.symbol, variant)
@@ -247,23 +266,26 @@ class OrderService:
                     continue
                 position.current_price = tick.price
                 position.current_pnl = (tick.price - position.entry_price) * position.quantity
-                if self.execution_enabled and key not in self._inflight:
+                owner_id = self._position_users.get(key)
+                if self._user_execution_enabled(owner_id) and key not in self._inflight:
                     reason = ExitReason.STOP_LOSS if tick.price <= position.stop_loss_price else ExitReason.TAKE_PROFIT if tick.price >= position.take_profit_price else None
                     if reason:
                         self._inflight.add(key)
-                        exits.append((key, reason))
-        for key, reason in exits:
+                        exits.append((key, reason, self._position_users.get(key)))
+        for key, reason, user_id in exits:
             asyncio.create_task(
-                self._execute_risk_exit(key, tick.price, tick.timestamp, reason),
+                self._execute_risk_exit(key, tick.price, tick.timestamp, reason, user_id),
                 name=f"risk-exit-{key[0]}-{key[1].value}",
             )
 
-    async def _execute_risk_exit(self, key: tuple[str, StrategyVariant], price: Decimal, timestamp: datetime, reason: ExitReason) -> None:
+    async def _execute_risk_exit(self, key: tuple[str, StrategyVariant], price: Decimal, timestamp: datetime, reason: ExitReason, user_id: int | None = None) -> None:
+        token = current_user_id.set(user_id)
         try:
             await self._exit(key, price, timestamp, reason)
         except BinanceOrderError:
             logger.exception("risk_exit_failed symbol=%s variant=%s", *key)
         finally:
+            current_user_id.reset(token)
             async with self._lock:
                 self._inflight.discard(key)
 
@@ -271,10 +293,41 @@ class OrderService:
         if not test and not self.execution_enabled:
             raise BinanceOrderError("order execution is disabled by the global kill switch", 409)
         normalized = await self._normalize_order(params)
+        if not test:
+            await self._check_balance_utilization(normalized)
         response = await self._signed_request("POST", "/api/v3/order/test" if test else "/api/v3/order", normalized)
         if not test:
             await self._record(response, normalized)
         return response
+
+    async def _check_balance_utilization(self, order: dict[str, str]) -> None:
+        """Limit risk-increasing BUY orders; always permit exposure-reducing SELLs."""
+        if order.get("side") != "BUY":
+            return
+        rules = await self._rules(order["symbol"])
+        quote_asset = str(rules.get("_quoteAsset") or "USDT")
+        if "quoteOrderQty" in order:
+            required = Decimal(order["quoteOrderQty"])
+        else:
+            price = Decimal(order["price"]) if "price" in order else Decimal(0)
+            if price <= 0:
+                ticker = await self._public_request("GET", "/api/v3/ticker/price", {"symbol": order["symbol"]})
+                price = Decimal(str(ticker.get("price", "0")))
+            required = Decimal(order.get("quantity", "0")) * price
+        if required <= 0:
+            raise BinanceOrderError("unable to calculate order balance utilization", 422)
+        account = await self.account()
+        balance = next((item for item in account.get("balances", []) if item.get("asset") == quote_asset), None)
+        free = Decimal(str(balance.get("free", "0"))) if balance else Decimal(0)
+        if free <= 0:
+            raise BinanceOrderError(f"no free {quote_asset} balance is available", 422)
+        utilization = required / free * Decimal(100)
+        maximum = Decimal(str(self._settings.max_order_balance_utilization_percent))
+        if utilization > maximum:
+            raise BinanceOrderError(
+                f"risk guard rejected order: {utilization:.2f}% of free {quote_asset} would be used (maximum {maximum:.2f}%)",
+                422,
+            )
 
     async def query_order(self, symbol: str, order_id: int | None, client_id: str | None) -> dict[str, Any]:
         params = self._order_reference(symbol, order_id, client_id)
@@ -453,11 +506,12 @@ class OrderService:
                 raise BinanceOrderError("this buy order has no remaining quantity to square off", 409)
             self._squared_orders.add(key)
         try:
+            sell_quantity = await self._sellable_quantity(symbol, remaining_quantity)
             return await self.place_order({
                 "symbol": symbol,
                 "side": "SELL",
                 "type": "MARKET",
-                "quantity": str(remaining_quantity),
+                "quantity": str(sell_quantity),
                 "newClientOrderId": f"ctsSQ{order_id}"[:36],
                 "newOrderRespType": "FULL",
             })
@@ -495,6 +549,9 @@ class OrderService:
         position = Position(symbol=signal.symbol, variant=signal.variant, status=PositionStatus.OPEN, quantity=quantity, entry_price=price, current_price=price, current_pnl=Decimal(0), stop_loss_price=price * (Decimal(1) - Decimal(str(stop)) / 100), take_profit_price=price * (Decimal(1) + Decimal(str(self._settings.take_profit_percent)) / 100), opened_at=signal.timestamp)
         async with self._lock:
             self._positions[(signal.symbol, signal.variant)] = position
+            user_id = current_user_id.get()
+            if user_id is not None:
+                self._position_users[(signal.symbol, signal.variant)] = user_id
             self._repository.save_position(position)
 
     async def _exit(self, key: tuple[str, StrategyVariant], fallback: Decimal, timestamp: datetime, reason: ExitReason) -> None:
@@ -503,7 +560,8 @@ class OrderService:
             if not position or position.status is not PositionStatus.OPEN:
                 return
             quantity = position.quantity
-        response = await self.place_order({"symbol": key[0], "side": "SELL", "type": "MARKET", "quantity": str(quantity), "newClientOrderId": f"cts{key[1].value}{key[0]}S{int(timestamp.timestamp())}"[:36], "newOrderRespType": "FULL"})
+        sell_quantity = await self._sellable_quantity(key[0], quantity)
+        response = await self.place_order({"symbol": key[0], "side": "SELL", "type": "MARKET", "quantity": str(sell_quantity), "newClientOrderId": f"cts{key[1].value}{key[0]}S{int(timestamp.timestamp())}"[:36], "newOrderRespType": "FULL"})
         executed, price = self._execution(response, fallback)
         if executed <= 0:
             return
@@ -523,6 +581,34 @@ class OrderService:
                 self._repository.save_position(self._positions[key])
             if self._history:
                 self._history[-1].update(exit_reason=reason.value, strategy_variant=key[1].value)
+
+    async def _sellable_quantity(self, symbol: str, requested: Decimal) -> Decimal:
+        """Return the spendable base quantity accepted by Binance market filters.
+
+        A filled BUY's ``executedQty`` is gross. When commission is charged in
+        the base asset, the account's free balance is slightly lower. Capping
+        against the authoritative balance prevents insufficient-balance errors;
+        flooring to MARKET_LOT_SIZE prevents precision/step-size rejections.
+        """
+        rules = await self._rules(symbol)
+        base_asset = str(rules.get("_baseAsset") or symbol.removesuffix("USDT"))
+        account = await self.account()
+        balance = next(
+            (item for item in account.get("balances", []) if item.get("asset") == base_asset),
+            None,
+        )
+        free = Decimal(str(balance.get("free", "0"))) if balance else Decimal(0)
+        available = min(requested, free)
+        market_lot = rules.get("MARKET_LOT_SIZE", {})
+        lot = market_lot if market_lot.get("stepSize") not in {None, "0.00000000"} else rules.get("LOT_SIZE", {})
+        normalized = Decimal(self._floor(str(available), lot.get("stepSize")))
+        minimum = Decimal(str(lot.get("minQty", "0")))
+        if normalized <= 0 or normalized < minimum:
+            raise BinanceOrderError(
+                f"available {base_asset} balance ({free}) is below the minimum sell quantity",
+                422,
+            )
+        return normalized
 
     async def _normalize_order(self, params: dict[str, Any]) -> dict[str, str]:
         result = {key: str(value) for key, value in params.items() if value is not None}
@@ -565,7 +651,13 @@ class OrderService:
 
     def _validate_filters(self, params: dict[str, str], rules: dict[str, Any]) -> None:
         if "quantity" in params:
-            quantity, lot = Decimal(params["quantity"]), rules.get("LOT_SIZE", {})
+            market_lot = rules.get("MARKET_LOT_SIZE", {})
+            lot = (
+                market_lot
+                if params.get("type") == "MARKET" and market_lot.get("stepSize") not in {None, "0.00000000"}
+                else rules.get("LOT_SIZE", {})
+            )
+            quantity = Decimal(params["quantity"])
             if quantity <= 0 or quantity < Decimal(lot.get("minQty", "0")):
                 raise BinanceOrderError("quantity is below the symbol minimum", 422)
             maximum = Decimal(lot.get("maxQty", "0"))

@@ -241,3 +241,114 @@ body.trading-mode .price-chart { height: calc(100vh - 250px); min-height: 480px;
 .credential-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .credential-actions button { flex: 1; }
 
+/* Institutional terminal theme */
+:root { --bg:#0b0e11; --panel:#181a20; --line:#23262f; --muted:#848e9c; --text:#eaecef; --accent:#0ecb81; --danger:#f6465d; --surface-raised:#1e2329; --yellow:#fcd535; --blue:#316ecd; }
+html { background:var(--bg); }
+body { font-family:Inter,"Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--text); font-size:13px; }
+button,input,select,table,.price,.market-price-block,.candle-grid strong,.card strong,.badge,.management-list,.strategy-quantity,#last-update { font-family:"JetBrains Mono","Roboto Mono","Cascadia Code",Consolas,monospace; font-variant-numeric:tabular-nums slashed-zero; }
+header,main { width:min(1440px,calc(100% - 32px)); }
+header { min-height:64px; padding:12px 0; border-bottom:1px solid var(--line); }
+.brand-lockup { display:flex; align-items:center; gap:12px; }
+.brand-mark { display:grid; place-items:center; width:32px; height:32px; border:1px solid #4d461c; border-radius:4px; background:rgba(252,213,53,.08); color:var(--yellow); font:700 12px/1 "JetBrains Mono",Consolas,monospace; }
+h1 { font-size:17px; letter-spacing:-.02em; line-height:1.2; }
+h2 { font-size:16px; letter-spacing:-.01em; }
+h3 { font-size:14px; }
+.eyebrow { margin-bottom:3px; color:var(--muted); letter-spacing:.1em; font-size:9px; }
+.badge { border-radius:4px; padding:6px 9px; font-size:11px; }
+.badge.online { color:var(--accent); background:rgba(14,203,129,.08); border-color:rgba(14,203,129,.28); }
+.badge.offline { color:var(--yellow); background:rgba(252,213,53,.06); border-color:rgba(252,213,53,.25); }
+.summary-grid,.tick-grid,.feature-grid { gap:8px; }
+.summary-grid { margin:16px 0 8px; }
+.card,.panel,.tick-card,.feature { background:var(--panel); border-color:var(--line); border-radius:4px; }
+.card { padding:12px 14px; border-top:2px solid #30333c; }
+.card span,small { font-size:11px; }
+.card strong { margin-top:6px; font-size:15px; }
+.panel { margin-bottom:8px; padding:16px; box-shadow:none; }
+.panel-heading { gap:16px; }
+input,button,select { border-radius:4px; }
+input { background:#0f1115; }
+input:focus,select:focus { outline:1px solid var(--blue); border-color:var(--blue); }
+button { background:var(--blue); }
+button:hover { filter:brightness(1.12); }
+button.secondary { background:var(--surface-raised); }
+#message { margin:8px 0; color:var(--yellow); }
+.tick-card { padding:12px; }
+.tick-card:hover { border-color:#474d57; transform:none; background:#1e2026; }
+.price { margin:14px 0 5px; font-size:20px; }
+.feature { padding:10px 12px; }
+.feature-grid { margin-top:12px; }
+.market-tabs { margin:-16px -16px 0; background:#0f1115; }
+.market-tab { padding:10px 12px; }
+.market-heading { margin:0 -16px; padding:12px 16px; background:#121419; }
+.market-type { border:1px solid var(--line); background:var(--surface-raised); }
+.trading-workspace { margin-top:8px; }
+.chart-pane,.book-pane { background:var(--bg); border-color:var(--line); border-radius:4px; box-shadow:none; }
+.chart-toolbar,.book-heading,.indicator-legend { background:#121419; }
+.chart-toolbar { min-height:40px; padding:4px 8px; }
+.strategy-quantity { border-color:var(--line); border-radius:4px; }
+.timeframe-button,.chart-tool { border-radius:3px; }
+.candle-grid>div { padding:8px 10px; background:#111318; }
+.candle-grid span { margin-bottom:3px; font-size:10px; text-transform:uppercase; }
+.chart-attribution { padding:5px 10px; }
+.chart-attribution a { color:var(--yellow); }
+.book-heading { padding:10px 12px; }
+.mid-price { padding:9px 10px; background:#111814; color:var(--accent); font-size:17px; }
+.book-tables { background:var(--line); }
+table { background:var(--bg); border-radius:0; }
+caption { padding:8px 10px; background:#15171c; font-size:11px; text-transform:uppercase; }
+th,td { padding:6px 8px; border-top-color:rgba(35,38,47,.7); }
+th { font-size:9px; letter-spacing:.05em; }
+td { font-size:11px; }
+tbody tr:hover { background:var(--surface-raised); }
+.order-ticket,.order-manager { padding:12px; background:#121419; }
+.side-switch { gap:4px; }
+.side-switch button { background:var(--surface-raised); }
+.side-switch .buy.active { background:rgba(14,203,129,.1); }
+.side-switch .sell.active { background:rgba(246,70,93,.1); }
+.order-form input,.order-form select { border-radius:4px; background:#0f1115; border-color:var(--line); }
+.credential-panel { border-radius:4px; background:#15171c; border-color:var(--line); }
+.pnl-summary,.management-row { border-radius:4px; }
+.pnl-summary>div,.management-row { background:#15171c; }
+.order-status { border-radius:3px; }
+.auth-overlay { background:#0b0e11; }
+.auth-overlay::before { content:"SECURE ACCESS  /  DEMO ENVIRONMENT"; position:fixed; top:18px; left:24px; color:#5e6673; font:10px/1 "JetBrains Mono",Consolas,monospace; letter-spacing:.12em; }
+.auth-card { width:min(400px,100%); padding:24px; background:var(--panel); border-radius:6px; box-shadow:none; }
+.auth-card::before { content:"CT"; display:grid; place-items:center; width:36px; height:36px; margin-bottom:18px; border:1px solid #4d461c; border-radius:4px; color:var(--yellow); font:700 13px "JetBrains Mono",Consolas,monospace; }
+.auth-brand h2 { font-size:20px; }
+.auth-tabs { gap:0; margin-top:20px; border-bottom:1px solid var(--line); }
+.auth-tabs button { border:0; border-radius:0; }
+.auth-tabs button.active { color:var(--yellow); background:transparent; box-shadow:inset 0 -2px var(--yellow); }
+.auth-form { gap:10px; }
+.auth-form label { font-size:11px; }
+.auth-form input { padding:11px; }
+.auth-form button[type="submit"] { background:var(--blue); }
+.auth-footnote { padding-top:12px; border-top:1px solid var(--line); }
+body.trading-mode main { width:min(1600px,calc(100% - 16px)); }
+body.trading-mode #market-detail { padding:16px; background:var(--bg); }
+@media (max-width:760px) { header,main { width:min(100% - 16px,1440px); } header { align-items:flex-start; } .summary-grid { margin-top:8px; } .auth-overlay { padding:16px; } }
+
+.settings-overlay { position:fixed; inset:0; z-index:60; display:grid; place-items:center; padding:16px; background:rgba(5,7,9,.82); backdrop-filter:blur(3px); }
+.settings-card { width:min(460px,100%); padding:20px; border:1px solid var(--line); border-radius:6px; background:var(--panel); }
+.settings-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding-bottom:14px; border-bottom:1px solid var(--line); }
+.settings-heading button { padding:6px 8px; }
+.settings-copy { margin:14px 0; color:var(--muted); font-size:11px; line-height:1.55; }
+.settings-form { display:grid; gap:12px; }
+.settings-form label { display:grid; gap:5px; color:var(--muted); font-size:11px; font-weight:600; }
+.settings-form input { width:100%; color:var(--text); text-transform:none; }
+.settings-form>button { margin-top:4px; padding:11px; }
+#auth-user { color:var(--accent); }
+
+.account-balance-strip { display:flex; align-items:center; gap:7px; padding:7px 9px; border:1px solid var(--line); border-radius:4px; background:#15171c; color:var(--muted); font:10px/1.2 "JetBrains Mono",Consolas,monospace; white-space:nowrap; }
+.account-balance-strip strong { color:var(--text); font-size:11px; }
+.account-balance-strip i { width:1px; height:14px; background:var(--line); }
+.account-metric { display:grid; gap:3px; }
+.account-metric span { color:var(--muted); font-size:8px; letter-spacing:.06em; text-transform:uppercase; }
+.account-balance-strip #account-free-balance { color:var(--accent); }
+.account-balance-strip #account-utilization.warning { color:var(--danger); }
+body.trading-mode .market-heading { grid-template-columns:auto auto 1fr auto; column-gap:24px; }
+body.trading-mode .market-price-block { margin-left:0; }
+body.trading-mode .account-balance-strip { justify-self:start; align-self:stretch; margin-left:0; padding:6px 12px; background:#15171c; }
+body.trading-mode .account-balance-strip strong { font-size:11px; }
+body.trading-mode .detail-actions { justify-self:end; }
+@media (max-width:760px) { .account-balance-strip { justify-content:center; flex-wrap:wrap; } body.trading-mode .market-heading { grid-template-columns:1fr auto; } body.trading-mode .account-balance-strip { grid-column:1 / -1; grid-row:3; width:100%; margin-top:8px; } }
+

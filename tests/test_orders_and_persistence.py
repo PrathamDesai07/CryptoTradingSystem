@@ -1,12 +1,13 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 from config import get_settings
 from models import Position, PositionStatus, Signal, SignalAction, StrategyVariant
-from services.order_service import BinanceOrderError, OrderService
+from services.order_service import BinanceOrderError, OrderService, current_user_id
 from services.state_repository import StateRepository
 
 
@@ -79,9 +80,52 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(position.stop_loss_price, Decimal("36000"))
         self.assertEqual(position.take_profit_price, Decimal("42000"))
 
+    async def test_background_strategy_signal_uses_active_user_context(self):
+        self.service._user_sessions[7] = SimpleNamespace(verified=True, enabled=True)
+        observed_user_ids = []
+
+        async def place_order(params, test=False):
+            observed_user_ids.append(current_user_id.get())
+            return {"executedQty": params["quantity"], "cummulativeQuoteQty": "8"}
+
+        self.service.place_order = place_order
+        signal = Signal(
+            symbol="BTCUSDT", variant=StrategyVariant.A, action=SignalAction.BUY,
+            price=Decimal("40000"), fast_value=Decimal("40100"), slow_value=Decimal("40000"),
+            reason="test crossover", timestamp=datetime.now(UTC),
+        )
+        await self.service.process_signal_for_user(7, signal)
+        self.assertEqual(observed_user_ids, [7])
+        self.assertEqual(self.service._position_users[("BTCUSDT", StrategyVariant.A)], 7)
+
     async def test_strategy_quantity_must_be_positive(self):
         with self.assertRaises(BinanceOrderError):
             await self.service.set_strategy_order_quantity(Decimal("0"))
+
+    async def test_square_off_quantity_is_capped_to_free_balance_and_market_step(self):
+        self.service._symbol_rules["BTCUSDT"]["MARKET_LOT_SIZE"] = {
+            "minQty": "0.0001", "maxQty": "100", "stepSize": "0.0001"
+        }
+
+        async def account():
+            return {"balances": [{"asset": "BTC", "free": "0.00995", "locked": "0"}]}
+
+        self.service.account = account
+        quantity = await self.service._sellable_quantity("BTCUSDT", Decimal("0.01"))
+        self.assertEqual(quantity, Decimal("0.0099"))
+
+    async def test_balance_utilization_guard_rejects_oversized_buy_but_allows_sell(self):
+        async def account():
+            return {"balances": [{"asset": "USDT", "free": "100", "locked": "0"}]}
+
+        self.service.account = account
+        with self.assertRaisesRegex(BinanceOrderError, "risk guard rejected"):
+            await self.service._check_balance_utilization({
+                "symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quoteOrderQty": "81"
+            })
+        await self.service._check_balance_utilization({
+            "symbol": "BTCUSDT", "side": "SELL", "type": "MARKET", "quantity": "1"
+        })
 
     async def test_fifo_pnl_includes_base_and_quote_fees(self):
         trades = [

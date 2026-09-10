@@ -61,6 +61,8 @@ frontend_tick_poll_seconds: 5
 frontend_broadcast_interval_milliseconds: 100
 order_book_render_interval_milliseconds: 500
 order_size_usdt: 10
+# Reject risk-increasing BUY orders that consume more than this share of free quote balance.
+max_order_balance_utilization_percent: 80
 # Base-asset quantity used by automatic SMA/EMA strategy MARKET entries.
 strategy_order_quantity: 0.0001
 order_request_timeout_seconds: 10
