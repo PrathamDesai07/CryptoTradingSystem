@@ -38,6 +38,8 @@ from models import Position
 _PBKDF2_ITERATIONS = 260_000
 _SESSION_TTL = timedelta(days=7)
 _KEY_FILE_NAME = ".master_key"
+# Stable signed-bigint namespace for the Crypto Trading System execution engine.
+_POSTGRES_EXECUTION_LOCK_ID = 4851605261604401987
 
 
 def hash_password(password: str) -> str:
@@ -103,9 +105,82 @@ class DatabaseHandler:
         self.database_url = _database_url(database_url, database_password)
         self.is_postgres = bool(self.database_url)
         self.history_limit = history_limit
+        self._execution_lease: Any | None = None
         self._fernet = _load_fernet(master_key, self.path.parent)
         self._initialize()
         self._delete_expired_sessions()
+
+    def acquire_execution_lease(self) -> bool:
+        """Acquire a process-lifetime lease so only one engine uses this database.
+
+        PostgreSQL advisory locks are session scoped and therefore work across
+        Uvicorn workers, hosts, and containers. SQLite deployments use a native
+        non-blocking file lock beside the database.
+        """
+        if self._execution_lease is not None:
+            return True
+        if self.is_postgres:
+            connection = self._connect()
+            acquired = bool(
+                connection.execute(
+                    "SELECT pg_try_advisory_lock(?)",
+                    (_POSTGRES_EXECUTION_LOCK_ID,),
+                ).fetchone()[0]
+            )
+            if acquired:
+                self._execution_lease = connection
+            else:
+                connection.close()
+            return acquired
+
+        lock_path = self.path.with_suffix(self.path.suffix + ".execution.lock")
+        handle = lock_path.open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            handle.close()
+            return False
+        self._execution_lease = handle
+        return True
+
+    def release_execution_lease(self) -> None:
+        """Release the process-lifetime execution lease during clean shutdown."""
+        lease = self._execution_lease
+        self._execution_lease = None
+        if lease is None:
+            return
+        if not self.is_postgres:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lease.seek(0)
+                    msvcrt.locking(lease.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+            finally:
+                lease.close()
+            return
+        try:
+            lease.execute(
+                "SELECT pg_advisory_unlock(?)",
+                (_POSTGRES_EXECUTION_LOCK_ID,),
+            )
+        finally:
+            lease.close()
 
     # ------------------------------------------------------------------ setup
     def _connect(self) -> Any:
@@ -156,6 +231,18 @@ class DatabaseHandler:
             db.execute("CREATE TABLE IF NOT EXISTS orders (record_key TEXT PRIMARY KEY, recorded_at TEXT NOT NULL, symbol TEXT NOT NULL, payload TEXT NOT NULL)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_orders_symbol_time ON orders(symbol, recorded_at)")
             db.execute("CREATE TABLE IF NOT EXISTS positions (symbol TEXT NOT NULL, variant TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(symbol, variant))")
+            db.execute(f"""CREATE TABLE IF NOT EXISTS risk_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                account_id {reference_id},
+                asset TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                client_order_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL)""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_risk_reservations_account ON risk_reservations(account_id, asset)")
 
     def _delete_expired_sessions(self) -> None:
         with closing(self._connect()) as db, db:
@@ -388,6 +475,29 @@ class DatabaseHandler:
     def save_position(self, position: Position) -> None:
         with closing(self._connect()) as db, db:
             db.execute("INSERT INTO positions(symbol, variant, payload) VALUES(?,?,?) ON CONFLICT(symbol, variant) DO UPDATE SET payload=excluded.payload", (position.symbol, position.variant.value, position.model_dump_json()))
+
+    def load_risk_reservations(self) -> list[dict[str, Any]]:
+        with closing(self._connect()) as db:
+            rows = db.execute(
+                "SELECT reservation_id, account_id, asset, amount, client_order_id, symbol, side, status FROM risk_reservations"
+            ).fetchall()
+        columns = ("reservation_id", "account_id", "asset", "amount", "client_order_id", "symbol", "side", "status")
+        return [dict(zip(columns, row, strict=True)) for row in rows]
+
+    def save_risk_reservation(self, reservation: Any, status: str) -> None:
+        now = _now()
+        with closing(self._connect()) as db, db:
+            db.execute(
+                """INSERT INTO risk_reservations(reservation_id, account_id, asset, amount, client_order_id, symbol, side, status, created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(reservation_id) DO UPDATE SET
+                   amount=excluded.amount, status=excluded.status, updated_at=excluded.updated_at""",
+                (reservation.reservation_id, reservation.account_id, reservation.asset, str(reservation.amount),
+                 reservation.client_order_id, reservation.symbol, reservation.side, status, now, now),
+            )
+
+    def delete_risk_reservation(self, reservation_id: str) -> None:
+        with closing(self._connect()) as db, db:
+            db.execute("DELETE FROM risk_reservations WHERE reservation_id = ?", (reservation_id,))
 
 
 def _database_url(database_url: str | None, password: str | None) -> str | None:

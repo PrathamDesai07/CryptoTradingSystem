@@ -46,6 +46,7 @@ db_handler = DatabaseHandler(
 risk_engine = PreTradeRiskEngine(
     Decimal(str(settings.max_order_balance_utilization_percent)),
     Decimal(str(settings.max_order_notional_usdt)),
+    repository=db_handler,
 )
 reconciliation_service = ReconciliationService()
 order_service = OrderService(
@@ -62,12 +63,12 @@ async def handle_signal(signal: Signal) -> None:
     user_ids = order_service.active_strategy_user_ids()
     if user_ids:
         for user_id in user_ids:
-            asyncio.create_task(
+            order_service.create_background_task(
                 order_service.process_signal_for_user(user_id, signal),
                 name=f"strategy-order-user-{user_id}-{signal.symbol}-{signal.variant.value}",
             )
     else:
-        asyncio.create_task(
+        order_service.create_background_task(
             order_service.process_signal(signal),
             name=f"strategy-order-{signal.symbol}-{signal.variant.value}",
         )
@@ -113,40 +114,50 @@ market_data_client = BinanceStreamClient(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    if not db_handler.acquire_execution_lease():
+        raise RuntimeError(
+            "another Crypto Trading System process already owns the execution lease; "
+            "run exactly one Uvicorn worker per database"
+        )
     logger.info(
         "application_started environment=%s order_execution_enabled=%s",
         settings.app_environment,
         settings.order_execution_enabled,
     )
-    await tick_broadcaster.start()
-    await candle_service.start()
-    if settings.market_data_enabled:
-        await asyncio.gather(
-            *(
-                candle_service.bootstrap_history(
-                    symbol,
-                    settings.binance_market_rest_url,
-                    settings.candle_interval_name,
-                    settings.candle_history_bootstrap_limit,
-                    settings.candle_history_request_timeout_seconds,
+    try:
+        await tick_broadcaster.start()
+        await candle_service.start()
+        order_service.start_background_services()
+        if settings.market_data_enabled:
+            await asyncio.gather(
+                *(
+                    candle_service.bootstrap_history(
+                        symbol,
+                        settings.binance_market_rest_url,
+                        settings.candle_interval_name,
+                        settings.candle_history_bootstrap_limit,
+                        settings.candle_history_request_timeout_seconds,
+                    )
+                    for symbol in settings.symbols
                 )
-                for symbol in settings.symbols
             )
-        )
-        for symbol in settings.symbols:
-            await strategy_service.seed(
-                symbol,
-                await candle_service.history(
-                    symbol, settings.candle_history_bootstrap_limit
-                ),
-            )
-        await market_data_client.start()
-    yield
-    await market_data_client.stop()
-    order_service.clear_credentials()
-    await candle_service.stop()
-    await tick_broadcaster.stop()
-    logger.info("application_stopped")
+            for symbol in settings.symbols:
+                await strategy_service.seed(
+                    symbol,
+                    await candle_service.history(
+                        symbol, settings.candle_history_bootstrap_limit
+                    ),
+                )
+            await market_data_client.start()
+        yield
+    finally:
+        await market_data_client.stop()
+        await order_service.shutdown()
+        order_service.clear_credentials()
+        await candle_service.stop()
+        await tick_broadcaster.stop()
+        db_handler.release_execution_lease()
+        logger.info("application_stopped")
 
 
 app = FastAPI(

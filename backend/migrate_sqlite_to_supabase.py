@@ -23,6 +23,7 @@ TABLES = (
     "order_log",
     "orders",
     "positions",
+    "risk_reservations",
 )
 
 
@@ -52,6 +53,9 @@ def main() -> None:
         with destination:
             for table in TABLES:
                 columns = [row[1] for row in source.execute(f'PRAGMA table_info("{table}")')]
+                if not columns:
+                    print(f"{table}: not present in SQLite source, 0 rows copied")
+                    continue
                 rows = source.execute(f'SELECT * FROM "{table}"').fetchall()
                 if rows:
                     names = ",".join(f'"{name}"' for name in columns)

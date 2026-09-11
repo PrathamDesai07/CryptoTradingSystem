@@ -8,8 +8,9 @@ are reconnected through ``POST /api/order-session``.
 """
 
 from typing import Any
+import asyncio
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from api.routes import order_error
@@ -41,17 +42,17 @@ class UpdateCredentialsRequest(BaseModel):
 
 async def _activate(db: Any, service: Any, user_id: int, api_key: str, api_secret: str) -> dict[str, Any]:
     """Store encrypted keys, activate the in-memory session and verify online."""
-    db.set_user_credentials(user_id, db.encrypt_secret(api_key), db.encrypt_secret(api_secret))
+    await asyncio.to_thread(db.set_user_credentials, user_id, db.encrypt_secret(api_key), db.encrypt_secret(api_secret))
     status = await service.connect_user_credentials(user_id, api_key, api_secret)
     if status.get("verified") and status.get("can_trade"):
-        db.mark_credentials_verified(user_id)
+        await asyncio.to_thread(db.mark_credentials_verified, user_id)
     return status
 
 
 async def _session_status(db: Any, service: Any, user_id: int) -> dict[str, Any]:
     """Restore decrypted keys after a restart and report the account state."""
     if not service.has_active_session(user_id):
-        stored = db.get_user_credentials(user_id)
+        stored = await asyncio.to_thread(db.get_user_credentials, user_id)
         if stored is not None:
             try:
                 api_key = db.decrypt_secret(stored["api_key_enc"])
@@ -72,7 +73,7 @@ def _public_user(user: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.post("/auth/signup", status_code=201)
-async def signup(payload: SignupRequest, request: Request) -> dict[str, object]:
+async def signup(payload: SignupRequest, request: Request, response: Response) -> dict[str, object]:
     db = request.app.state.db_handler
     service = request.app.state.order_service
     username = payload.username.strip()
@@ -82,23 +83,24 @@ async def signup(payload: SignupRequest, request: Request) -> dict[str, object]:
     if not username or not api_key or not api_secret:
         raise HTTPException(status_code=422, detail="username and Binance Demo keys are required")
     try:
-        user_id = db.create_user(username, display_name, hash_password(payload.password))
+        user_id = await asyncio.to_thread(db.create_user, username, display_name, hash_password(payload.password))
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     status = await _activate(db, service, user_id, api_key, api_secret)
-    token = db.create_session(user_id)
-    user = db.get_user_by_id(user_id)
+    token = await asyncio.to_thread(db.create_session, user_id)
+    response.set_cookie("cts_session", token, httponly=True, secure=request.app.state.settings.is_production, samesite="strict", max_age=604800, path="/")
+    user = await asyncio.to_thread(db.get_user_by_id, user_id)
     return {"token": token, "user": _public_user(user), "session": status}
 
 
 @router.post("/auth/login")
-async def login(payload: LoginRequest, request: Request) -> dict[str, object]:
+async def login(payload: LoginRequest, request: Request, response: Response) -> dict[str, object]:
     db = request.app.state.db_handler
     service = request.app.state.order_service
-    user = db.get_user_by_username(payload.username.strip())
+    user = await asyncio.to_thread(db.get_user_by_username, payload.username.strip())
     if user is None or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="invalid username or password")
-    stored = db.get_user_credentials(user["id"])
+    stored = await asyncio.to_thread(db.get_user_credentials, user["id"])
     if stored is None:
         raise HTTPException(status_code=409, detail="no Binance Demo keys are stored for this account; sign up again")
     try:
@@ -107,7 +109,8 @@ async def login(payload: LoginRequest, request: Request) -> dict[str, object]:
     except ValueError as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
     status = await _activate(db, service, user["id"], api_key, api_secret)
-    token = db.create_session(user["id"])
+    token = await asyncio.to_thread(db.create_session, user["id"])
+    response.set_cookie("cts_session", token, httponly=True, secure=request.app.state.settings.is_production, samesite="strict", max_age=604800, path="/")
     return {"token": token, "user": _public_user(user), "session": status}
 
 
@@ -122,11 +125,12 @@ async def me(request: Request, user: dict[str, Any] = Depends(require_user)) -> 
 
 
 @router.post("/auth/logout")
-async def logout(request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
+async def logout(request: Request, response: Response, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     db = request.app.state.db_handler
     service = request.app.state.order_service
-    db.delete_session(bearer_token(request))
+    await asyncio.to_thread(db.delete_session, bearer_token(request))
     service.deactivate_user_session(int(user["id"]))
+    response.delete_cookie("cts_session", path="/")
     return {"logged_out": True}
 
 
@@ -135,7 +139,7 @@ async def verify_binance(request: Request, user: dict[str, Any] = Depends(requir
     """Re-run the online canTrade check for the signed-in account."""
     db = request.app.state.db_handler
     service = request.app.state.order_service
-    stored = db.get_user_credentials(int(user["id"]))
+    stored = await asyncio.to_thread(db.get_user_credentials, int(user["id"]))
     if stored is None:
         raise HTTPException(status_code=409, detail="no Binance Demo keys are stored for this account")
     try:
@@ -162,7 +166,7 @@ async def update_credentials(
     db = request.app.state.db_handler
     service = request.app.state.order_service
     user_id = int(user["id"])
-    previous = db.get_user_credentials(user_id)
+    previous = await asyncio.to_thread(db.get_user_credentials, user_id)
     api_key, api_secret = payload.api_key.strip(), payload.api_secret.strip()
     if not api_key or not api_secret:
         raise HTTPException(status_code=422, detail="API key and secret are required")
@@ -181,10 +185,8 @@ async def update_credentials(
             )
         )
 
-    db.set_user_credentials(
-        user_id,
-        db.encrypt_secret(api_key),
-        db.encrypt_secret(api_secret),
+    await asyncio.to_thread(
+        db.set_user_credentials, user_id, db.encrypt_secret(api_key), db.encrypt_secret(api_secret)
     )
-    db.mark_credentials_verified(user_id)
+    await asyncio.to_thread(db.mark_credentials_verified, user_id)
     return {"updated": True, "verified": True, "execution_enabled": True}

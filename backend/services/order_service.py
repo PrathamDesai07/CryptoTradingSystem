@@ -73,6 +73,7 @@ class OrderService:
                  market_tick_loader: Callable[[str], Awaitable[Tick | None]] | None = None) -> None:
         self._settings = settings
         self._positions: dict[PositionKey, Position] = {}
+        self._positions_by_symbol: dict[str, set[PositionKey]] = {}
         self._strategy_enabled_users: dict[int, bool] = {}
         self._strategy_status: dict[int, dict[str, Any]] = {}
         self._orders: dict[str, dict[str, Any]] = {}
@@ -81,12 +82,20 @@ class OrderService:
         self._exchange_info_loaded_at: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self._inflight: set[PositionKey] = set()
+        self._pending_entries: set[PositionKey] = set()
         self._runtime_api_key: SecretStr | None = None
         self._runtime_api_secret: SecretStr | None = None
         self._session_execution_enabled = False
         self._user_sessions: dict[int, _UserSession] = {}
         self._strategy_order_quantity = Decimal(str(settings.strategy_order_quantity))
         self._squared_orders: set[tuple[str, int]] = set()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._request_latencies_ms: deque[float] = deque(maxlen=1024)
+        self._metric_counts: dict[str, int] = {"requests": 0, "errors": 0, "risk_rejections": 0, "reconciliations": 0}
+        self._request_semaphore = asyncio.Semaphore(settings.max_concurrent_exchange_requests)
+        self._consecutive_order_failures = 0
+        self._circuit_open_until = 0.0
+        self._shutdown_event = asyncio.Event()
         self._repository = repository or StateRepository(settings.state_database_path, settings.strategy_signal_history_size)
         self._risk = risk_engine or PreTradeRiskEngine(
             Decimal(str(settings.max_order_balance_utilization_percent)),
@@ -100,10 +109,44 @@ class OrderService:
             if client_id:
                 self._orders[client_id] = record
         for position in self._repository.load_positions():
-            self._positions[(None, position.symbol, position.variant)] = position
+            key = (None, position.symbol, position.variant)
+            self._positions[key] = position
+            self._positions_by_symbol.setdefault(position.symbol, set()).add(key)
         if hasattr(self._repository, "load_user_positions"):
             for user_id, position in self._repository.load_user_positions():
-                self._positions[(user_id, position.symbol, position.variant)] = position
+                key = (user_id, position.symbol, position.variant)
+                self._positions[key] = position
+                self._positions_by_symbol.setdefault(position.symbol, set()).add(key)
+
+    def create_background_task(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
+        """Create and retain an execution task until it reaches a terminal state."""
+        task = asyncio.create_task(coroutine, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def shutdown(self) -> None:
+        """Drain submitted execution tasks before process shutdown."""
+        self._shutdown_event.set()
+        tasks = tuple(self._background_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def start_background_services(self) -> None:
+        self._shutdown_event.clear()
+        self.create_background_task(self._reconciliation_loop(), name="order-reconciliation-loop")
+
+    async def _reconciliation_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            for user_id in self.active_execution_user_ids():
+                await self._reconcile_account_reservations(user_id)
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self._settings.reconciliation_interval_seconds,
+                )
+            except TimeoutError:
+                pass
 
     @property
     def execution_enabled(self) -> bool:
@@ -206,6 +249,10 @@ class OrderService:
             session.enabled = can_trade
             if not can_trade:
                 return {"connected": True, "verified": True, "can_trade": False, "error": "these Binance Demo credentials are not permitted to trade"}
+            self.create_background_task(
+                self._reconcile_account_reservations(user_id),
+                name=f"reservation-reconcile-user-{user_id}",
+            )
             return {"connected": True, "verified": True, "can_trade": True, "error": None}
         finally:
             current_user_id.reset(token)
@@ -220,6 +267,10 @@ class OrderService:
     def active_strategy_user_ids(self) -> tuple[int, ...]:
         """Users whose verified Demo sessions can receive automatic orders."""
         return tuple(user_id for user_id, session in self._user_sessions.items() if session.verified and session.enabled and self._strategy_enabled_users.get(user_id, True))
+
+    def active_execution_user_ids(self) -> tuple[int, ...]:
+        """All verified accounts, including those with automatic strategy disabled."""
+        return tuple(user_id for user_id, session in self._user_sessions.items() if session.verified)
 
     def strategy_status(self, user_id: int) -> dict[str, Any]:
         return {"enabled": self._strategy_enabled_users.get(user_id, True), "last_event": self._strategy_status.get(user_id)}
@@ -249,7 +300,7 @@ class OrderService:
         """Audit rows for the bound user; falls back to legacy history otherwise."""
         user_id = current_user_id.get()
         if user_id is not None and hasattr(self._repository, "get_user_orders"):
-            return tuple(self._repository.get_user_orders(user_id, symbol, limit))
+            return tuple(await asyncio.to_thread(self._repository.get_user_orders, user_id, symbol, limit))
         return await self.orders(symbol, limit)
 
     async def positions(self, symbol: str | None = None) -> tuple[Position, ...]:
@@ -274,6 +325,16 @@ class OrderService:
                 return
             if signal.action is SignalAction.EXIT and (not position or position.status is not PositionStatus.OPEN):
                 return
+            if signal.action is SignalAction.BUY:
+                owner = key[0]
+                open_count = sum(
+                    1 for (position_owner, _, _), item in self._positions.items()
+                    if position_owner == owner and item.status is PositionStatus.OPEN
+                )
+                pending_count = sum(1 for pending in self._pending_entries if pending[0] == owner)
+                if open_count + pending_count >= self._settings.max_open_positions_per_user:
+                    return
+                self._pending_entries.add(key)
             self._inflight.add(key)
         try:
             if signal.action is SignalAction.BUY:
@@ -292,11 +353,13 @@ class OrderService:
         finally:
             async with self._lock:
                 self._inflight.discard(key)
+                self._pending_entries.discard(key)
 
     async def process_tick(self, tick: Tick) -> None:
         exits: list[tuple[PositionKey, ExitReason]] = []
         async with self._lock:
-            for key, position in tuple(self._positions.items()):
+            for key in tuple(self._positions_by_symbol.get(tick.symbol, ())):
+                position = self._positions.get(key)
                 owner_id, symbol, _ = key
                 if symbol != tick.symbol:
                     continue
@@ -310,7 +373,7 @@ class OrderService:
                         self._inflight.add(key)
                         exits.append((key, reason))
         for key, reason in exits:
-            asyncio.create_task(
+            self.create_background_task(
                 self._execute_risk_exit(key, tick.price, tick.timestamp, reason),
                 name=f"risk-exit-{key[0]}-{key[1]}-{key[2].value}",
             )
@@ -329,6 +392,10 @@ class OrderService:
     async def place_order(self, params: dict[str, Any], test: bool = False) -> dict[str, Any]:
         if not test and not self.execution_enabled:
             raise BinanceOrderError("order execution is disabled by the global kill switch", 409)
+        if not test and self._consecutive_order_failures >= self._settings.max_consecutive_order_failures:
+            if monotonic() < self._circuit_open_until:
+                raise BinanceOrderError("order circuit breaker is open after consecutive exchange failures", 503)
+            self._consecutive_order_failures = 0
         clean = params.copy()
         audit = clean.pop("_audit", {})
         normalized = await self._normalize_order(clean)
@@ -338,6 +405,7 @@ class OrderService:
                 await self._ensure_market_fresh(normalized)
                 reservation = await self._risk.reserve(current_user_id.get(), normalized, await self._rules(normalized["symbol"]), self.account, self._market_price)
             except PreTradeRiskError as error:
+                self._metric_counts["risk_rejections"] += 1
                 raise BinanceOrderError(str(error), 422) from error
         try:
             response = await self._signed_request("POST", "/api/v3/order/test" if test else "/api/v3/order", normalized)
@@ -345,16 +413,22 @@ class OrderService:
             if not test and error.uncertain:
                 await self._risk.mark_uncertain(reservation)
                 reconciled = await self._reconciliation.reconcile_unknown(normalized, self._query_by_client_id)
+                self._metric_counts["reconciliations"] += 1
                 if reconciled is None:
                     raise BinanceOrderError("order outcome remains unknown after reconciliation; capital reservation retained", 503, uncertain=True) from error
                 response = reconciled
-                await self._risk.release(reservation)
+                await self._risk.acknowledge(reservation, str(response.get("status") or "UNKNOWN"))
             else:
                 await self._risk.release(reservation)
+                self._consecutive_order_failures += 1
+                if self._consecutive_order_failures >= self._settings.max_consecutive_order_failures:
+                    self._circuit_open_until = monotonic() + self._settings.order_circuit_breaker_cooldown_seconds
                 raise
         else:
-            await self._risk.release(reservation)
+            await self._risk.acknowledge(reservation, str(response.get("status") or "UNKNOWN"))
         if not test:
+            self._consecutive_order_failures = 0
+            self._circuit_open_until = 0.0
             await self._record(response, normalized, audit if isinstance(audit, dict) else {})
         return response
 
@@ -370,6 +444,13 @@ class OrderService:
             raise PreTradeRiskError(
                 f"risk guard rejected order: market data is stale ({age:.2f}s old)"
             )
+        if "price" in order:
+            price = Decimal(order["price"])
+            deviation = abs(price - tick.price) / tick.price * Decimal(100)
+            if deviation > Decimal(str(self._settings.max_price_deviation_percent)):
+                raise PreTradeRiskError(
+                    f"risk guard rejected order: price deviation {deviation:.2f}% exceeds maximum"
+                )
 
     async def _check_balance_utilization(self, order: dict[str, str]) -> None:
         """Compatibility wrapper used by focused risk tests."""
@@ -387,15 +468,32 @@ class OrderService:
         result = await self._signed_request("GET", "/api/v3/order", {"symbol": symbol, "origClientOrderId": client_id})
         return result if isinstance(result, dict) else {}
 
+    async def _reconcile_account_reservations(self, user_id: int) -> None:
+        token = current_user_id.set(user_id)
+        try:
+            for reservation in self._risk.pending(user_id):
+                if not reservation.client_order_id:
+                    continue
+                try:
+                    result = await self._query_by_client_id(reservation.symbol, reservation.client_order_id)
+                except BinanceOrderError:
+                    logger.warning("reservation_reconciliation_deferred user=%s client_id=%s", user_id, reservation.client_order_id)
+                    continue
+                await self._risk.acknowledge(reservation, str(result.get("status") or "UNKNOWN"))
+        finally:
+            current_user_id.reset(token)
+
     async def query_order(self, symbol: str, order_id: int | None, client_id: str | None) -> dict[str, Any]:
         params = self._order_reference(symbol, order_id, client_id)
         response = await self._signed_request("GET", "/api/v3/order", params)
+        await self._risk.acknowledge_client(current_user_id.get(), str(response.get("clientOrderId") or client_id or ""), str(response.get("status") or "UNKNOWN"))
         await self._record(response, params)
         return response
 
     async def cancel_order(self, symbol: str, order_id: int | None, client_id: str | None) -> dict[str, Any]:
         params = self._order_reference(symbol, order_id, client_id)
         response = await self._signed_request("DELETE", "/api/v3/order", params)
+        await self._risk.acknowledge_client(current_user_id.get(), str(response.get("clientOrderId") or client_id or ""), str(response.get("status") or "CANCELED"))
         await self._record(response, params)
         return response
 
@@ -608,10 +706,13 @@ class OrderService:
         async with self._lock:
             user_id = current_user_id.get()
             self._positions[(user_id, signal.symbol, signal.variant)] = position
-            if user_id is not None and hasattr(self._repository, "save_user_position"):
-                self._repository.save_user_position(user_id, position)
-            else:
-                self._repository.save_position(position)
+            self._positions_by_symbol.setdefault(signal.symbol, set()).add(
+                (user_id, signal.symbol, signal.variant)
+            )
+        if user_id is not None and hasattr(self._repository, "save_user_position"):
+            await asyncio.to_thread(self._repository.save_user_position, user_id, position)
+        else:
+            await asyncio.to_thread(self._repository.save_position, position)
 
     async def _exit(self, key: PositionKey, fallback: Decimal, timestamp: datetime, reason: ExitReason) -> None:
         async with self._lock:
@@ -638,12 +739,16 @@ class OrderService:
                     closed_at=None if remaining > 0 else timestamp,
                 )
                 self._positions[key] = Position.model_validate(updated)
-                if key[0] is not None and hasattr(self._repository, "save_user_position"):
-                    self._repository.save_user_position(key[0], self._positions[key])
-                else:
-                    self._repository.save_position(self._positions[key])
-            if self._history:
-                self._history[-1].update(exit_reason=reason.value, strategy_variant=variant.value)
+                saved_position = self._positions[key]
+                if self._history:
+                    self._history[-1].update(exit_reason=reason.value, strategy_variant=variant.value)
+            else:
+                saved_position = None
+        if saved_position is not None:
+            if key[0] is not None and hasattr(self._repository, "save_user_position"):
+                await asyncio.to_thread(self._repository.save_user_position, key[0], saved_position)
+            else:
+                await asyncio.to_thread(self._repository.save_position, saved_position)
 
     async def _sellable_quantity(self, symbol: str, requested: Decimal) -> Decimal:
         """Return the spendable base quantity accepted by Binance market filters.
@@ -758,14 +863,14 @@ class OrderService:
             # A signed-in account: persist a queryable audit row (status, price,
             # quantity, timestamps) without touching the process-global history.
             if hasattr(self._repository, "log_user_order"):
-                self._repository.log_user_order(user_id, record, str(record.get("source") or "manual"))
+                await asyncio.to_thread(self._repository.log_user_order, user_id, record, str(record.get("source") or "manual"))
             return
         client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
         async with self._lock:
             if client_id:
                 self._orders[client_id] = record
             self._history.append(record)
-            self._repository.save_order(record)
+        await asyncio.to_thread(self._repository.save_order, record)
 
     async def _signed_request(self, method: str, path: str, params: dict[str, Any]) -> Any:
         api_key, secret = self._api_key(), self._api_secret()
@@ -780,16 +885,36 @@ class OrderService:
         return await self._request(method, path, urlencode(params), None)
 
     async def _request(self, method: str, path: str, query: str, api_key: str | None) -> Any:
+        started = monotonic()
+        self._metric_counts["requests"] += 1
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self._request_sync, method, path, query, api_key),
-                timeout=self._settings.order_request_timeout_seconds + 1,
-            )
-        except TimeoutError as error:
-            raise BinanceOrderError(
-                "Binance did not respond in time; reconciling by client order ID",
-                uncertain=True,
-            ) from error
+            try:
+                async with self._request_semaphore:
+                    return await asyncio.wait_for(
+                        asyncio.to_thread(self._request_sync, method, path, query, api_key),
+                        timeout=self._settings.order_request_timeout_seconds + 1,
+                    )
+            except TimeoutError as error:
+                raise BinanceOrderError(
+                    "Binance did not respond in time; reconciling by client order ID",
+                    uncertain=True,
+                ) from error
+        except Exception:
+            self._metric_counts["errors"] += 1
+            raise
+        finally:
+            self._request_latencies_ms.append((monotonic() - started) * 1000)
+
+    def metrics(self) -> dict[str, Any]:
+        values = sorted(self._request_latencies_ms)
+        percentile = lambda fraction: values[min(len(values) - 1, int((len(values) - 1) * fraction))] if values else 0.0
+        return {
+            **self._metric_counts,
+            "active_tasks": len(self._background_tasks),
+            "inflight_positions": len(self._inflight),
+            "circuit_breaker_open": self._consecutive_order_failures >= self._settings.max_consecutive_order_failures,
+            "latency_ms": {"p50": percentile(0.50), "p95": percentile(0.95), "p99": percentile(0.99)},
+        }
 
     def _request_sync(self, method: str, path: str, query: str, api_key: str | None) -> Any:
         url = f"{self._settings.binance_testnet_rest_url}{path}"

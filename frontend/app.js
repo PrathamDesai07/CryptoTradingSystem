@@ -6,10 +6,9 @@ const socketUrl = () => {
 };
 
 const TOKEN_KEY = "cts_token";
-const getAuthToken = () => window.localStorage.getItem(TOKEN_KEY) || "";
+const getAuthToken = () => "";
 const storeAuthToken = (token) => {
-  if (token) window.localStorage.setItem(TOKEN_KEY, token);
-  else window.localStorage.removeItem(TOKEN_KEY);
+  window.localStorage.removeItem(TOKEN_KEY);
 };
 
 const state = {

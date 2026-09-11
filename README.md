@@ -91,7 +91,7 @@ python -m pip install -r backend\requirements.txt
 python backend\migrate_sqlite_to_supabase.py
 ```
 
-The migration creates all eight tables, copies them in foreign-key-safe order,
+The migration creates all application tables, copies them in foreign-key-safe order,
 resets identity sequences, and verifies row counts. It can be rerun safely.
 Preserve `db/.master_key` (or configure the same `credentials_master_key`) so
 migrated encrypted Binance credentials remain decryptable.
@@ -127,6 +127,22 @@ The launcher creates `.venv` when necessary, installs the pinned dependencies,
 creates a local `.env` from `.env.example` when missing, starts the backend, and
 opens the API-served JavaScript dashboard. The backend and frontend share one
 process, so pressing `Ctrl+C` stops the complete application.
+
+The execution engine intentionally runs as exactly one process per database.
+At startup it acquires a PostgreSQL advisory lock (or a local SQLite file lock),
+so an accidental multi-worker deployment fails fast instead of duplicating user
+credential caches, strategy signals, capital reservations, or Binance orders.
+Do not launch this application with Uvicorn's `--workers` option.
+
+Execution safety also includes durable PostgreSQL-backed capital reservations,
+base-asset reservation for SELL orders, terminal-status release for open orders,
+automatic reservation reconciliation when an account reconnects, stale-price and
+price-deviation checks, maximum notional/open-position limits, a bounded exchange
+request semaphore, and a cooldown circuit breaker. Execution tasks are supervised
+and drained during shutdown. Auth sessions use HttpOnly cookies, and protected
+WebSocket and symbol-mutation operations require authentication. Operational
+request counts and p50/p95/p99 exchange latency are available at
+`/api/execution/metrics`.
 
 Credentials are collected during account creation and may be replaced from the
 dashboard after password confirmation. They are encrypted in SQLite, verified

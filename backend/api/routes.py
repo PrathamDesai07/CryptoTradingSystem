@@ -1,5 +1,6 @@
 """REST and WebSocket endpoints exposed to the frontend."""
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -142,7 +143,7 @@ async def list_symbols(request: Request) -> dict[str, object]:
 
 
 @router.post("/symbols", status_code=201)
-async def add_symbol(payload: SymbolRequest, request: Request) -> dict[str, object]:
+async def add_symbol(payload: SymbolRequest, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
     try:
         symbol = normalize_symbol(payload.symbol)
         added = await request.app.state.market_data_client.add_symbol(symbol)
@@ -167,7 +168,7 @@ async def add_symbol(payload: SymbolRequest, request: Request) -> dict[str, obje
 
 
 @router.delete("/symbols/{symbol}")
-async def remove_symbol(symbol: str, request: Request) -> dict[str, object]:
+async def remove_symbol(symbol: str, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
     try:
         normalized = normalize_symbol(symbol)
         removed = await request.app.state.market_data_client.remove_symbol(normalized)
@@ -306,7 +307,7 @@ async def order_session(request: Request, user: dict[str, object] = Depends(requ
     """Per-account session status; keys are stored encrypted in SQLite."""
     db = request.app.state.db_handler
     service = request.app.state.order_service
-    has_stored = db.get_user_credentials(int(user["id"])) is not None
+    has_stored = await asyncio.to_thread(db.get_user_credentials, int(user["id"])) is not None
     return {
         "username": user["username"],
         "credentials_configured": has_stored or service.credentials_configured,
@@ -326,13 +327,13 @@ async def connect_order_session(payload: RuntimeCredentialsRequest, request: Req
     api_key, api_secret = payload.api_key.strip(), payload.api_secret.strip()
     if not api_key or not api_secret:
         raise HTTPException(status_code=422, detail="API key and secret are required")
-    db.set_user_credentials(int(user["id"]), db.encrypt_secret(api_key), db.encrypt_secret(api_secret))
+    await asyncio.to_thread(db.set_user_credentials, int(user["id"]), db.encrypt_secret(api_key), db.encrypt_secret(api_secret))
     try:
         status = await service.connect_user_credentials(int(user["id"]), api_key, api_secret)
     except BinanceOrderError as error:
         raise order_error(error) from error
     if status.get("verified") and status.get("can_trade"):
-        db.mark_credentials_verified(int(user["id"]))
+        await asyncio.to_thread(db.mark_credentials_verified, int(user["id"]))
         return {"connected": True, "storage": "encrypted_database", "account": {"can_trade": True}}
     raise order_error(BinanceOrderError(status.get("error") or "Binance Demo keys could not be verified", 403 if status.get("verified") else 502))
 
@@ -531,6 +532,12 @@ async def account(request: Request, user: dict[str, object] = Depends(require_us
         raise order_error(error) from error
 
 
+@router.get("/execution/metrics")
+async def execution_metrics(request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+    """Bounded in-process execution telemetry for operational review."""
+    return request.app.state.order_service.metrics()
+
+
 @router.get("/dashboard")
 async def dashboard(request: Request) -> dict[str, object]:
     """Return the currently implemented dashboard state in one request."""
@@ -562,6 +569,10 @@ async def dashboard(request: Request) -> dict[str, object]:
 
 @websocket_router.websocket("/ws/ticks")
 async def tick_stream(websocket: WebSocket) -> None:
+    token = websocket.cookies.get("cts_session", "")
+    if not token or await asyncio.to_thread(websocket.app.state.db_handler.get_session_user, token) is None:
+        await websocket.close(code=4401, reason="authentication required")
+        return
     broadcaster = websocket.app.state.tick_broadcaster
     market_client = websocket.app.state.market_data_client
     await broadcaster.connect(websocket)

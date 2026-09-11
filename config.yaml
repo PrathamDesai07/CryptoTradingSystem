@@ -67,6 +67,12 @@ max_order_balance_utilization_percent: 80
 max_order_notional_usdt: 1000
 # Reject new BUY orders when the latest streamed tick is older than this.
 max_market_data_age_seconds: 5
+max_open_positions_per_user: 10
+max_price_deviation_percent: 5
+max_concurrent_exchange_requests: 8
+max_consecutive_order_failures: 5
+order_circuit_breaker_cooldown_seconds: 30
+reconciliation_interval_seconds: 5
 # Base-asset quantity used by automatic SMA/EMA strategy MARKET entries.
 strategy_order_quantity: 0.0001
 order_request_timeout_seconds: 10

@@ -154,7 +154,10 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_balance_utilization_guard_rejects_oversized_buy_but_allows_sell(self):
         async def account():
-            return {"balances": [{"asset": "USDT", "free": "100", "locked": "0"}]}
+            return {"balances": [
+                {"asset": "USDT", "free": "100", "locked": "0"},
+                {"asset": "BTC", "free": "2", "locked": "0"},
+            ]}
 
         self.service.account = account
         with self.assertRaisesRegex(BinanceOrderError, "risk guard rejected"):
@@ -162,7 +165,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 "symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quoteOrderQty": "81"
             })
         await self.service._check_balance_utilization({
-            "symbol": "BTCUSDT", "side": "SELL", "type": "MARKET", "quantity": "1"
+            "symbol": "BTCUSDT", "side": "SELL", "type": "MARKET", "quantity": "0.001"
         })
 
     async def test_stale_market_data_rejects_buy_but_not_protective_sell(self):
@@ -228,3 +231,13 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         restored = repository.load_user_positions()
         self.assertEqual(restored[0][0], user_id)
         self.assertEqual(restored[0][1].symbol, "BTCUSDT")
+
+    def test_only_one_process_can_hold_sqlite_execution_lease(self):
+        path = str(Path(self.temp.name) / "lease.db")
+        first = DatabaseHandler(path, 10)
+        second = DatabaseHandler(path, 10)
+        self.assertTrue(first.acquire_execution_lease())
+        self.assertFalse(second.acquire_execution_lease())
+        first.release_execution_lease()
+        self.assertTrue(second.acquire_execution_lease())
+        second.release_execution_lease()

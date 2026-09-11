@@ -160,6 +160,7 @@ data/*.db-wal
 db/*.db
 db/*.db-shm
 db/*.db-wal
+db/*.execution.lock
 db/.master_key
 .envrc
 .venv
