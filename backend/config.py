@@ -74,11 +74,15 @@ class Settings(BaseModel):
     order_book_render_interval_milliseconds: int = Field(ge=100, le=5000)
     order_size_usdt: float = Field(gt=0)
     max_order_balance_utilization_percent: float = Field(gt=0, le=100)
+    max_order_notional_usdt: float = Field(gt=0)
+    max_market_data_age_seconds: float = Field(gt=0)
     strategy_order_quantity: float = Field(gt=0)
     order_request_timeout_seconds: float = Field(gt=0, le=60)
     order_recv_window_milliseconds: int = Field(ge=1, le=60000)
     exchange_info_cache_seconds: int = Field(ge=1, le=86400)
     state_database_path: str
+    database_url: SecretStr | None = None
+    database_password: SecretStr | None = None
     fast_sma_period: int = Field(ge=1)
     slow_ema_period: int = Field(ge=2)
     strategy_signal_history_size: int = Field(ge=1, le=10000)

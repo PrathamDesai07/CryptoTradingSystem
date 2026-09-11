@@ -6,9 +6,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from config import get_settings
-from models import Position, PositionStatus, Signal, SignalAction, StrategyVariant
+from models import Position, PositionStatus, Signal, SignalAction, StrategyVariant, Tick
 from services.order_service import BinanceOrderError, OrderService, current_user_id
 from services.db_handler import DatabaseHandler, hash_password
+from services.pretrade_risk import PreTradeRiskError
 from services.state_repository import StateRepository
 
 
@@ -163,6 +164,20 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         await self.service._check_balance_utilization({
             "symbol": "BTCUSDT", "side": "SELL", "type": "MARKET", "quantity": "1"
         })
+
+    async def test_stale_market_data_rejects_buy_but_not_protective_sell(self):
+        stale = Tick(
+            symbol="BTCUSDT", price="40000", quantity="1",
+            timestamp=datetime(2020, 1, 1, tzinfo=UTC),
+        )
+
+        async def load_tick(_symbol):
+            return stale
+
+        self.service._market_tick_loader = load_tick
+        with self.assertRaisesRegex(PreTradeRiskError, "market data is stale"):
+            await self.service._ensure_market_fresh({"symbol": "BTCUSDT", "side": "BUY"})
+        await self.service._ensure_market_fresh({"symbol": "BTCUSDT", "side": "SELL"})
 
     async def test_fifo_pnl_includes_base_and_quote_fees(self):
         trades = [

@@ -63,6 +63,10 @@ order_book_render_interval_milliseconds: 500
 order_size_usdt: 10
 # Reject risk-increasing BUY orders that consume more than this share of free quote balance.
 max_order_balance_utilization_percent: 80
+# Independent fat-finger ceiling for any risk-increasing order.
+max_order_notional_usdt: 1000
+# Reject new BUY orders when the latest streamed tick is older than this.
+max_market_data_age_seconds: 5
 # Base-asset quantity used by automatic SMA/EMA strategy MARKET entries.
 strategy_order_quantity: 0.0001
 order_request_timeout_seconds: 10
@@ -70,6 +74,11 @@ order_recv_window_milliseconds: 5000
 exchange_info_cache_seconds: 3600
 # SQLite file lives under the repository db/ folder for future development.
 state_database_path: db/trading_state.db
+# Supabase PostgreSQL. Keep the password separate so reserved URL characters are
+# encoded safely by the backend. Replace these placeholders locally or set the
+# matching environment variables; never commit a real database password.
+database_url: ${DATABASE_URL:-postgresql://postgres.rbesfelvatcvyiavqqdz@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres}
+database_password: ${X5VHUrfoUIANOgFj:-}
 fast_sma_period: 5
 slow_ema_period: 10
 strategy_signal_history_size: 200

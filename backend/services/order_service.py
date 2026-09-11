@@ -10,7 +10,7 @@ import hmac
 import json
 import logging
 from time import monotonic, time
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -67,7 +67,10 @@ class OrderService:
         "OPOCO": "/api/v3/orderList/opoco",
     }
 
-    def __init__(self, settings: Settings, repository: Any | None = None, risk_engine: PreTradeRiskEngine | None = None, reconciliation_service: ReconciliationService | None = None) -> None:
+    def __init__(self, settings: Settings, repository: Any | None = None,
+                 risk_engine: PreTradeRiskEngine | None = None,
+                 reconciliation_service: ReconciliationService | None = None,
+                 market_tick_loader: Callable[[str], Awaitable[Tick | None]] | None = None) -> None:
         self._settings = settings
         self._positions: dict[PositionKey, Position] = {}
         self._strategy_enabled_users: dict[int, bool] = {}
@@ -85,8 +88,12 @@ class OrderService:
         self._strategy_order_quantity = Decimal(str(settings.strategy_order_quantity))
         self._squared_orders: set[tuple[str, int]] = set()
         self._repository = repository or StateRepository(settings.state_database_path, settings.strategy_signal_history_size)
-        self._risk = risk_engine or PreTradeRiskEngine(Decimal(str(settings.max_order_balance_utilization_percent)))
+        self._risk = risk_engine or PreTradeRiskEngine(
+            Decimal(str(settings.max_order_balance_utilization_percent)),
+            Decimal(str(settings.max_order_notional_usdt)),
+        )
         self._reconciliation = reconciliation_service or ReconciliationService()
+        self._market_tick_loader = market_tick_loader
         for record in self._repository.load_orders():
             self._history.append(record)
             client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
@@ -328,6 +335,7 @@ class OrderService:
         reservation = None
         if not test:
             try:
+                await self._ensure_market_fresh(normalized)
                 reservation = await self._risk.reserve(current_user_id.get(), normalized, await self._rules(normalized["symbol"]), self.account, self._market_price)
             except PreTradeRiskError as error:
                 raise BinanceOrderError(str(error), 422) from error
@@ -349,6 +357,19 @@ class OrderService:
         if not test:
             await self._record(response, normalized, audit if isinstance(audit, dict) else {})
         return response
+
+    async def _ensure_market_fresh(self, order: dict[str, str]) -> None:
+        """Reject only risk-increasing orders when streamed market data is stale."""
+        if order.get("side") != "BUY" or self._market_tick_loader is None:
+            return
+        tick = await self._market_tick_loader(order["symbol"])
+        if tick is None:
+            raise PreTradeRiskError("risk guard rejected order: no live market tick is available")
+        age = (datetime.now(UTC) - tick.timestamp).total_seconds()
+        if age > self._settings.max_market_data_age_seconds:
+            raise PreTradeRiskError(
+                f"risk guard rejected order: market data is stale ({age:.2f}s old)"
+            )
 
     async def _check_balance_utilization(self, order: dict[str, str]) -> None:
         """Compatibility wrapper used by focused risk tests."""

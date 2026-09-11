@@ -42,3 +42,21 @@ class ExecutionSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["orderId"], 99)
         self.assertEqual(len(calls), 2)
+
+    async def test_hard_notional_limit_rejects_fat_finger_order(self):
+        engine = PreTradeRiskEngine(Decimal("80"), Decimal("50"))
+
+        async def account():
+            return {"balances": [{"asset": "USDT", "free": "1000", "locked": "0"}]}
+
+        async def price(_symbol):
+            return Decimal("1")
+
+        with self.assertRaisesRegex(PreTradeRiskError, "exceeds maximum"):
+            await engine.reserve(
+                7,
+                {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quoteOrderQty": "51"},
+                {"_quoteAsset": "USDT"},
+                account,
+                price,
+            )

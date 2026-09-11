@@ -1,4 +1,4 @@
-"""Central SQLite access for users, sessions, credentials and order audit.
+"""Central SQLite/PostgreSQL access for users, sessions and order audit.
 
 Everything that touches the database goes through this module so the rest of
 the backend talks to one handler wired in ``backend/main.py``.
@@ -24,6 +24,12 @@ from pathlib import Path
 import secrets
 import sqlite3
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
+
+try:
+    import psycopg
+except ImportError:  # SQLite-only development and unit-test installs remain usable.
+    psycopg = None
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -64,22 +70,49 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-class DatabaseHandler:
-    """SQLite repository: auth, encrypted credentials and order audit."""
+class _PostgresConnection:
+    """Small DB-API compatibility layer for the repository's portable SQL."""
 
-    def __init__(self, path: str, history_limit: int, master_key: str | None = None) -> None:
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> Any:
+        return self._connection.execute(sql.replace("?", "%s"), parameters)
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def __enter__(self) -> "_PostgresConnection":
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, *args: Any) -> Any:
+        return self._connection.__exit__(*args)
+
+
+class DatabaseHandler:
+    """Portable repository backed by SQLite or Supabase PostgreSQL."""
+
+    def __init__(self, path: str, history_limit: int, master_key: str | None = None,
+                 database_url: str | None = None, database_password: str | None = None) -> None:
         target = Path(path)
         if not target.is_absolute():
             target = Path(__file__).resolve().parents[2] / target
         target.parent.mkdir(parents=True, exist_ok=True)
         self.path = target
+        self.database_url = _database_url(database_url, database_password)
+        self.is_postgres = bool(self.database_url)
         self.history_limit = history_limit
         self._fernet = _load_fernet(master_key, self.path.parent)
         self._initialize()
         self._delete_expired_sessions()
 
     # ------------------------------------------------------------------ setup
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> Any:
+        if self.is_postgres:
+            if psycopg is None:
+                raise RuntimeError("PostgreSQL configured but psycopg is not installed")
+            return _PostgresConnection(psycopg.connect(self.database_url))
         connection = sqlite3.connect(self.path, timeout=5)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -87,15 +120,19 @@ class DatabaseHandler:
 
     def _initialize(self) -> None:
         with closing(self._connect()) as db, db:
-            db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)")
-            db.execute("CREATE TABLE IF NOT EXISTS user_credentials (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, api_key_enc TEXT NOT NULL, api_secret_enc TEXT NOT NULL, last_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
-            db.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)")
+            user_id = "BIGSERIAL PRIMARY KEY" if self.is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+            order_id = "BIGSERIAL PRIMARY KEY" if self.is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+            reference_id = "BIGINT" if self.is_postgres else "INTEGER"
+            enabled_type = "BOOLEAN NOT NULL DEFAULT TRUE" if self.is_postgres else "INTEGER NOT NULL DEFAULT 1"
+            db.execute(f"CREATE TABLE IF NOT EXISTS users (id {user_id}, username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)")
+            db.execute(f"CREATE TABLE IF NOT EXISTS user_credentials (user_id {reference_id} PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, api_key_enc TEXT NOT NULL, api_secret_enc TEXT NOT NULL, last_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            db.execute(f"CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id {reference_id} NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
-            db.execute("CREATE TABLE IF NOT EXISTS user_strategy_settings (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL)")
-            db.execute("CREATE TABLE IF NOT EXISTS user_positions (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, symbol TEXT NOT NULL, variant TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, symbol, variant))")
+            db.execute(f"CREATE TABLE IF NOT EXISTS user_strategy_settings (user_id {reference_id} PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, enabled {enabled_type}, updated_at TEXT NOT NULL)")
+            db.execute(f"CREATE TABLE IF NOT EXISTS user_positions (user_id {reference_id} NOT NULL REFERENCES users(id) ON DELETE CASCADE, symbol TEXT NOT NULL, variant TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, symbol, variant))")
             db.execute("""CREATE TABLE IF NOT EXISTS order_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                id %s,
+                user_id %s NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 record_key TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT,
@@ -111,7 +148,7 @@ class DatabaseHandler:
                 status_time TEXT,
                 recorded_at TEXT NOT NULL,
                 payload TEXT NOT NULL,
-                UNIQUE(user_id, record_key))""")
+                UNIQUE(user_id, record_key))""" % (order_id, reference_id))
             db.execute("CREATE INDEX IF NOT EXISTS idx_order_log_user_time ON order_log(user_id, recorded_at DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_order_log_user_symbol ON order_log(user_id, symbol, recorded_at DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_order_log_user_status ON order_log(user_id, status)")
@@ -139,13 +176,18 @@ class DatabaseHandler:
         """Create a user and return its id; raise ValueError when the name is taken."""
         with closing(self._connect()) as db, db:
             try:
+                suffix = " RETURNING id" if self.is_postgres else ""
                 cursor = db.execute(
-                    "INSERT INTO users(username, display_name, password_hash, created_at) VALUES(?,?,?,?)",
+                    "INSERT INTO users(username, display_name, password_hash, created_at) VALUES(?,?,?,?)" + suffix,
                     (username, display_name, password_hash, _now()),
                 )
-            except sqlite3.IntegrityError as error:
+            except Exception as error:
+                if not isinstance(error, sqlite3.IntegrityError) and not (
+                    psycopg is not None and isinstance(error, psycopg.IntegrityError)
+                ):
+                    raise
                 raise ValueError("username is already registered") from error
-            return int(cursor.lastrowid)
+            return int(cursor.fetchone()[0] if self.is_postgres else cursor.lastrowid)
 
     def get_user_by_username(self, username: str) -> dict[str, Any] | None:
         with closing(self._connect()) as db:
@@ -246,7 +288,7 @@ class DatabaseHandler:
         with closing(self._connect()) as db, db:
             db.execute(
                 "INSERT INTO user_strategy_settings(user_id, enabled, updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at",
-                (user_id, int(enabled), _now()),
+                (user_id, bool(enabled) if self.is_postgres else int(enabled), _now()),
             )
 
     def load_user_positions(self) -> list[tuple[int, Position]]:
@@ -336,7 +378,7 @@ class DatabaseHandler:
         key = str(record.get("clientOrderId") or record.get("newClientOrderId") or record.get("orderId") or record["recordedAt"])
         payload = json.dumps(record, default=str, separators=(",", ":"))
         with closing(self._connect()) as db, db:
-            db.execute("INSERT OR REPLACE INTO orders(record_key, recorded_at, symbol, payload) VALUES(?,?,?,?)", (key, record["recordedAt"], record.get("symbol", ""), payload))
+            db.execute("INSERT INTO orders(record_key, recorded_at, symbol, payload) VALUES(?,?,?,?) ON CONFLICT(record_key) DO UPDATE SET recorded_at=excluded.recorded_at, symbol=excluded.symbol, payload=excluded.payload", (key, record["recordedAt"], record.get("symbol", ""), payload))
 
     def load_positions(self) -> list[Position]:
         with closing(self._connect()) as db:
@@ -345,7 +387,27 @@ class DatabaseHandler:
 
     def save_position(self, position: Position) -> None:
         with closing(self._connect()) as db, db:
-            db.execute("INSERT OR REPLACE INTO positions(symbol, variant, payload) VALUES(?,?,?)", (position.symbol, position.variant.value, position.model_dump_json()))
+            db.execute("INSERT INTO positions(symbol, variant, payload) VALUES(?,?,?) ON CONFLICT(symbol, variant) DO UPDATE SET payload=excluded.payload", (position.symbol, position.variant.value, position.model_dump_json()))
+
+
+def _database_url(database_url: str | None, password: str | None) -> str | None:
+    """Insert a separately configured password into a PostgreSQL URL safely."""
+    if not database_url:
+        return None
+    if "[YOUR-PASSWORD]" in database_url and not password:
+        return None
+    if "[YOUR-PASSWORD]" in database_url:
+        database_url = database_url.replace(":[YOUR-PASSWORD]@", "@")
+    parts = urlsplit(database_url.strip())
+    if parts.scheme not in {"postgresql", "postgres"}:
+        raise ValueError("DATABASE_URL must use postgresql://")
+    if password and parts.hostname:
+        username = quote(parts.username or "postgres", safe="")
+        host = parts.hostname
+        port = f":{parts.port}" if parts.port else ""
+        netloc = f"{username}:{quote(password, safe='')}@{host}{port}"
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    return database_url.strip()
 
 
 def _now(offset: timedelta | None = None) -> str:

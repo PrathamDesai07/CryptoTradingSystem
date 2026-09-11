@@ -80,6 +80,22 @@ trading_symbols: BTCUSDT,ETHUSDT
 order_execution_enabled: false
 ```
 
+### Supabase PostgreSQL
+
+Shared application state can be stored in Supabase PostgreSQL. The connection
+template and separate password setting are in `config.yaml`; set
+`database_password` there or set `DATABASE_PASSWORD` in the environment. Then run:
+
+```powershell
+python -m pip install -r backend\requirements.txt
+python backend\migrate_sqlite_to_supabase.py
+```
+
+The migration creates all eight tables, copies them in foreign-key-safe order,
+resets identity sequences, and verifies row counts. It can be rerun safely.
+Preserve `db/.master_key` (or configure the same `credentials_master_key`) so
+migrated encrypted Binance credentials remain decryptable.
+
 #### Local backend setup
 
 Python 3.11 or newer is recommended. From the repository root on PowerShell:

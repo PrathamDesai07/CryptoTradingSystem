@@ -22,8 +22,9 @@ class RiskReservation:
 class PreTradeRiskEngine:
     """Serialize balance checks and reserve capital until order acknowledgement."""
 
-    def __init__(self, maximum_utilization_percent: Decimal) -> None:
+    def __init__(self, maximum_utilization_percent: Decimal, maximum_order_notional: Decimal | None = None) -> None:
         self._maximum = maximum_utilization_percent
+        self._maximum_order_notional = maximum_order_notional
         self._reserved: dict[tuple[int | None, str], Decimal] = {}
         self._uncertain: dict[str, RiskReservation] = {}
         self._lock = asyncio.Lock()
@@ -42,6 +43,10 @@ class PreTradeRiskEngine:
         required = Decimal(order["quoteOrderQty"]) if "quoteOrderQty" in order else Decimal(order.get("quantity", "0")) * (Decimal(order["price"]) if "price" in order else await price_loader(order["symbol"]))
         if required <= 0:
             raise PreTradeRiskError("unable to calculate order balance utilization")
+        if self._maximum_order_notional is not None and required > self._maximum_order_notional:
+            raise PreTradeRiskError(
+                f"risk guard rejected order: notional {required} exceeds maximum {self._maximum_order_notional}"
+            )
         async with self._lock:
             account = await account_loader()
             balance = next((item for item in account.get("balances", []) if item.get("asset") == quote_asset), None)

@@ -40,14 +40,20 @@ db_handler = DatabaseHandler(
     settings.state_database_path,
     settings.strategy_signal_history_size,
     master_key=settings.credentials_master_key.get_secret_value() if settings.credentials_master_key else None,
+    database_url=settings.database_url.get_secret_value() if settings.database_url else None,
+    database_password=settings.database_password.get_secret_value() if settings.database_password else None,
 )
-risk_engine = PreTradeRiskEngine(Decimal(str(settings.max_order_balance_utilization_percent)))
+risk_engine = PreTradeRiskEngine(
+    Decimal(str(settings.max_order_balance_utilization_percent)),
+    Decimal(str(settings.max_order_notional_usdt)),
+)
 reconciliation_service = ReconciliationService()
 order_service = OrderService(
     settings,
     repository=db_handler,
     risk_engine=risk_engine,
     reconciliation_service=reconciliation_service,
+    market_tick_loader=tick_store.get,
 )
 
 
