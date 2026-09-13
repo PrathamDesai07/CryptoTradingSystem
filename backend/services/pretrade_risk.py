@@ -46,6 +46,7 @@ class PreTradeRiskEngine:
         rules: dict[str, Any],
         account_loader: Callable[[], Awaitable[dict[str, Any]]],
         price_loader: Callable[[str], Awaitable[Decimal]],
+        enforce_utilization: bool = True,
     ) -> RiskReservation | None:
         side = str(order.get("side") or "").upper()
         if side == "BUY":
@@ -78,7 +79,7 @@ class PreTradeRiskEngine:
                 )
             if side == "BUY":
                 utilization = required / free * Decimal(100)
-                if utilization > self._maximum:
+                if enforce_utilization and utilization > self._maximum:
                     raise PreTradeRiskError(f"risk guard rejected order: {utilization:.2f}% of unreserved {asset} would be used (maximum {self._maximum:.2f}%)")
             reservation = RiskReservation(
                 uuid4().hex, account_id, asset, required,

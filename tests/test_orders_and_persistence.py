@@ -199,6 +199,25 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result["realized_pnl"], 0)
         self.assertGreater(result["unrealized_pnl"], 0)
 
+    async def test_fifo_pnl_tracks_sell_order_until_buy_square_off(self):
+        trades = [
+            {"id": 1, "orderId": 21, "qty": "0.01", "quoteQty": "400", "commission": "0", "commissionAsset": "USDT", "time": 1, "isBuyer": False},
+        ]
+
+        async def all_trades(_symbol):
+            return trades
+
+        self.service._all_trades = all_trades
+        result = await self.service.pnl("BTCUSDT", Decimal("39000"))
+        order = next(item for item in result["orders"] if item["order_id"] == 21)
+        self.assertEqual(order["remaining_quantity"], Decimal("0.01"))
+        self.assertEqual(result["open_quantity"], Decimal("-0.01"))
+
+        trades.append({"id": 2, "orderId": 22, "qty": "0.01", "quoteQty": "390", "commission": "0", "commissionAsset": "USDT", "time": 2, "isBuyer": True})
+        result = await self.service.pnl("BTCUSDT", Decimal("39000"))
+        self.assertEqual(result["open_quantity"], Decimal("0"))
+        self.assertEqual(next(item for item in result["orders"] if item["order_id"] == 21)["remaining_quantity"], Decimal("0"))
+
     async def test_order_list_types_use_distinct_official_paths(self):
         self.service._session_execution_enabled = True
         calls = []

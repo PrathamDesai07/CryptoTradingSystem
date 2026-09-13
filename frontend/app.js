@@ -993,12 +993,12 @@ function renderRecentOrders(orders) {
       : ` · P&amp;L <span data-order-pnl="${escapeHtml(order.orderId)}" class="${Number(pnlValue) >= 0 ? "pnl-positive" : "pnl-negative"}">${Number(pnlValue) >= 0 ? "+" : ""}${formatPrice(pnlValue)}</span>`;
     const remaining = Number(pnl?.remaining_quantity || 0);
     const minNotional = state.pnlBasis?.minNotional || 0;
-    const closed = status === "FILLED" && order.side === "BUY" && remaining > 0;
-    const squareable = closed && (!minNotional || Number(pnl?.notional || 0) >= minNotional);
+    const open = status === "FILLED" && (order.side === "BUY" || order.side === "SELL") && remaining > 0;
+    const squareable = open && (!minNotional || Number(pnl?.notional || 0) >= minNotional);
     const squareOff = squareable
       ? `<button type="button" data-close-quantity="${remaining}" data-order-id="${escapeHtml(order.orderId)}">Square off</button>`
       : "";
-    const dust = closed && !squareable
+    const dust = open && !squareable
       ? `<span class="order-status" title="Remaining quantity is worth less than Binance's ${formatPrice(minNotional)} USDT minimum order value">Below min</span>`
       : "";
     row.innerHTML = `<div><strong>${escapeHtml(order.side)} ${escapeHtml(order.type)} · ${escapeHtml(quantity)}</strong><br><span>#${escapeHtml(identifier)}${average > 0 ? ` @ ${formatPrice(average)}` : ""}${pnlText}</span></div><div class="order-row-actions"><span class="order-status ${status.toLowerCase()}">${escapeHtml(status)}</span>${dust}${squareOff}</div>`;
@@ -1010,13 +1010,13 @@ elements.recentOrderList.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-close-quantity]");
   if (!button || !state.selectedSymbol) return;
   button.disabled = true;
-  elements.orderMessage.textContent = "Submitting immediate square-off MARKET sell...";
+  elements.orderMessage.textContent = "Submitting immediate square-off MARKET order...";
   try {
     const orderId = button.dataset.orderId;
     const response = await request(`orders/${encodeURIComponent(state.selectedSymbol)}/${encodeURIComponent(orderId)}/square-off`, { method: "POST" });
     const settlement = response.settlement;
     elements.orderMessage.textContent = settlement
-      ? `Square-off filled: sold ${formatQuantity(settlement.base_quantity_sold)} · ${formatPrice(settlement.quote_credited)} ${settlement.quote_asset} credited.`
+      ? `Square-off filled: ${response.order.side === "SELL" ? "sold" : "bought"} ${formatQuantity(settlement.base_quantity_sold)} · ${formatPrice(settlement.quote_credited)} ${settlement.quote_asset} settled.`
       : `Square-off order ${response.order.orderId}: ${response.order.status}.`;
     await refreshOrderManagement();
     await loadAccountBalance();

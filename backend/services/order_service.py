@@ -429,6 +429,7 @@ class OrderService:
             self._consecutive_order_failures = 0
         clean = params.copy()
         audit = clean.pop("_audit", {})
+        bypass_utilization = bool(isinstance(audit, dict) and audit.get("square_off"))
         normalized = await self._normalize_order(clean)
         rules = await self._rules(normalized["symbol"])
         await self._enforce_min_notional(normalized, rules)
@@ -436,7 +437,10 @@ class OrderService:
         if not test:
             try:
                 await self._ensure_market_fresh(normalized)
-                reservation = await self._risk.reserve(current_user_id.get(), normalized, rules, self.account, self._market_price)
+                reservation = await self._risk.reserve(
+                    current_user_id.get(), normalized, rules, self.account, self._market_price,
+                    enforce_utilization=not bypass_utilization,
+                )
             except PreTradeRiskError as error:
                 self._metric_counts["risk_rejections"] += 1
                 raise BinanceOrderError(str(error), 422) from error
@@ -669,6 +673,7 @@ class OrderService:
         min_notional = Decimal(str(notional_filter.get("minNotional", "0")))
         lots: deque[dict[str, Any]] = deque()
         realized_by_order: dict[int, Decimal] = {}
+        all_order_ids: set[int] = set()
         fees_other: dict[str, Decimal] = {}
         for trade in sorted(trades, key=lambda item: (int(item.get("time", 0)), int(item.get("id", 0)))):
             quantity = Decimal(str(trade["qty"]))
@@ -676,44 +681,55 @@ class OrderService:
             commission = Decimal(str(trade.get("commission", "0")))
             commission_asset = str(trade.get("commissionAsset", ""))
             order_id = int(trade["orderId"])
-            if commission_asset not in {base_asset, quote_asset} and commission:
+            all_order_ids.add(order_id)
+            if commission_asset not in {base_asset, quote_asset} and commission > 0:
                 fees_other[commission_asset] = fees_other.get(commission_asset, Decimal(0)) + commission
             if trade.get("isBuyer"):
-                net_quantity = quantity - commission if commission_asset == base_asset else quantity
+                remaining = quantity - commission if commission_asset == base_asset else quantity
                 cost = quote + commission if commission_asset == quote_asset else quote
-                if net_quantity > 0:
-                    lots.append({"order_id": order_id, "quantity": net_quantity, "cost": cost})
+                while remaining > 0 and lots and lots[0]["side"] == "SELL":
+                    lot = lots[0]
+                    used = min(remaining, lot["quantity"])
+                    short_proceeds = lot["cost"] * used / lot["quantity"]
+                    buy_cost = cost * used / remaining if remaining else Decimal(0)
+                    realized_by_order[order_id] = realized_by_order.get(order_id, Decimal(0)) + short_proceeds - buy_cost
+                    lot["quantity"] -= used
+                    lot["cost"] -= short_proceeds
+                    remaining -= used
+                    if lot["quantity"] <= 0:
+                        lots.popleft()
+                if remaining > 0:
+                    lots.append({"order_id": order_id, "side": "BUY", "quantity": remaining, "cost": cost * remaining / (quantity or Decimal(1))})
                 continue
             disposed = quantity + commission if commission_asset == base_asset else quantity
             proceeds = quote - commission if commission_asset == quote_asset else quote
             remaining = disposed
-            matched_cost = Decimal(0)
-            matched_quantity = Decimal(0)
-            while remaining > 0 and lots:
+            while remaining > 0 and lots and lots[0]["side"] == "BUY":
                 lot = lots[0]
                 used = min(remaining, lot["quantity"])
-                unit_cost = lot["cost"] / lot["quantity"]
-                matched_cost += unit_cost * used
-                matched_quantity += used
+                matched_cost = lot["cost"] * used / lot["quantity"]
+                matched_proceeds = proceeds * used / disposed if disposed else Decimal(0)
+                realized_by_order[order_id] = realized_by_order.get(order_id, Decimal(0)) + matched_proceeds - matched_cost
                 lot["quantity"] -= used
-                lot["cost"] -= unit_cost * used
+                lot["cost"] -= matched_cost
                 remaining -= used
                 if lot["quantity"] <= 0:
                     lots.popleft()
-            if matched_quantity > 0:
-                matched_proceeds = proceeds * (matched_quantity / disposed)
-                realized_by_order[order_id] = realized_by_order.get(order_id, Decimal(0)) + matched_proceeds - matched_cost
+            if remaining > 0:
+                lots.append({"order_id": order_id, "side": "SELL", "quantity": remaining, "cost": proceeds * remaining / (disposed or Decimal(1))})
 
         unrealized_by_order: dict[int, Decimal] = {}
         remaining_by_order: dict[int, Decimal] = {}
         open_quantity = Decimal(0)
         open_cost = Decimal(0)
         for lot in lots:
-            open_quantity += lot["quantity"]
-            open_cost += lot["cost"]
-            unrealized_by_order[lot["order_id"]] = unrealized_by_order.get(lot["order_id"], Decimal(0)) + current_price * lot["quantity"] - lot["cost"]
+            signed_quantity = lot["quantity"] if lot["side"] == "BUY" else -lot["quantity"]
+            open_quantity += signed_quantity
+            open_cost += lot["cost"] if lot["side"] == "BUY" else -lot["cost"]
+            unrealized = current_price * lot["quantity"] - lot["cost"] if lot["side"] == "BUY" else lot["cost"] - current_price * lot["quantity"]
+            unrealized_by_order[lot["order_id"]] = unrealized_by_order.get(lot["order_id"], Decimal(0)) + unrealized
             remaining_by_order[lot["order_id"]] = remaining_by_order.get(lot["order_id"], Decimal(0)) + lot["quantity"]
-        order_ids = set(realized_by_order) | set(unrealized_by_order)
+        order_ids = all_order_ids | set(realized_by_order) | set(unrealized_by_order)
         return {
             "symbol": symbol,
             "method": "FIFO",
@@ -754,7 +770,7 @@ class OrderService:
         return collected
 
     async def square_off_order(self, symbol: str, order_id: int) -> dict[str, Any]:
-        """Market-sell the quantity still remaining on one filled buy order.
+        """Submit the opposite market order for one filled BUY or SELL order.
 
         Whether a lot is already squared off is decided by Binance's own fill
         ledger (via FIFO), never by remembered client state, so a partial or
@@ -770,28 +786,34 @@ class OrderService:
             user_id = current_user_id.get()
             async with self._lock:
                 tracked_quantity = self._open_order_positions.get((user_id, symbol, order_id))
-            pnl_state = await self.pnl(symbol, Decimal(0))
-            pnl_order = next((item for item in pnl_state["orders"] if item["order_id"] == order_id), None)
-            remaining_quantity = Decimal(0) if pnl_order is None else Decimal(pnl_order["remaining_quantity"])
-            if tracked_quantity is not None:
-                remaining_quantity = min(remaining_quantity, tracked_quantity)
-            if remaining_quantity <= 0:
-                raise BinanceOrderError("this buy order has already been fully squared off", 409)
             async with self._lock:
                 matches = [item for item in self._history if item.get("symbol") == symbol and int(item.get("orderId", -1)) == order_id]
                 source = matches[-1] if matches else None
             if source is None:
                 source = await self.query_order(symbol, order_id, None)
-            if not source or source.get("side") != "BUY" or source.get("status") != "FILLED":
-                raise BinanceOrderError("only a filled buy order can be squared off", 422)
-            sell_quantity = await self._sellable_quantity(symbol, remaining_quantity)
+            if not source or source.get("side") not in {"BUY", "SELL"} or source.get("status") != "FILLED":
+                raise BinanceOrderError("only a filled BUY or SELL order can be squared off", 422)
+            pnl_state = await self.pnl(symbol, Decimal(0))
+            pnl_order = next((item for item in pnl_state["orders"] if item["order_id"] == order_id), None)
+            remaining_quantity = Decimal(0) if pnl_order is None else Decimal(pnl_order["remaining_quantity"])
+            if tracked_quantity is not None:
+                remaining_quantity = min(remaining_quantity or tracked_quantity, tracked_quantity)
+            if remaining_quantity <= 0:
+                raise BinanceOrderError("this order has already been fully squared off", 409)
+            close_side = "SELL" if source["side"] == "BUY" else "BUY"
+            close_quantity = await (
+                self._sellable_quantity(symbol, remaining_quantity)
+                if close_side == "SELL"
+                else self._buyable_quantity(symbol, remaining_quantity)
+            )
             response = await self.place_order({
                 "symbol": symbol,
-                "side": "SELL",
+                "side": close_side,
                 "type": "MARKET",
-                "quantity": str(sell_quantity),
+                "quantity": str(close_quantity),
                 "newClientOrderId": f"ctsSQ{order_id}"[:36],
                 "newOrderRespType": "FULL",
+                "_audit": {"source": "square-off", "matched_order_id": order_id, "square_off": True},
             })
             await self._record_order_match(user_id, symbol, source, response)
             return response
@@ -921,6 +943,24 @@ class OrderService:
             )
         return normalized
 
+    async def _buyable_quantity(self, symbol: str, requested: Decimal) -> Decimal:
+        rules = await self._rules(symbol)
+        quote_asset = str(rules.get("_quoteAsset") or "USDT")
+        account = await self.account()
+        balance = next((item for item in account.get("balances", []) if item.get("asset") == quote_asset), None)
+        free_quote = Decimal(str(balance.get("free", "0"))) if balance else Decimal(0)
+        price = await self._market_price(symbol)
+        if price <= 0:
+            raise BinanceOrderError(f"no live price is available for {symbol}", 503)
+        available = min(requested, free_quote / price)
+        market_lot = rules.get("MARKET_LOT_SIZE", {})
+        lot = market_lot if market_lot.get("stepSize") not in {None, "0.00000000"} else rules.get("LOT_SIZE", {})
+        normalized = Decimal(self._floor(str(available), lot.get("stepSize")))
+        minimum = Decimal(str(lot.get("minQty", "0")))
+        if normalized <= 0 or normalized < minimum:
+            raise BinanceOrderError(f"available {quote_asset} balance ({free_quote}) is below the minimum buy quantity", 422)
+        return normalized
+
     async def _normalize_order(self, params: dict[str, Any]) -> dict[str, str]:
         result = {key: str(value) for key, value in params.items() if value is not None}
         result["symbol"] = result.get("symbol", "").strip().upper()
@@ -1007,7 +1047,7 @@ class OrderService:
             # quantity, timestamps) without touching the process-global history.
             if hasattr(self._repository, "log_user_order"):
                 await asyncio.to_thread(self._repository.log_user_order, user_id, record, str(record.get("source") or "manual"))
-            if record.get("side") == "BUY" and record.get("status") == "FILLED" and record.get("orderId") is not None:
+            if record.get("side") in {"BUY", "SELL"} and record.get("status") == "FILLED" and record.get("orderId") is not None:
                 async with self._lock:
                     self._open_order_positions[(user_id, str(record["symbol"]), int(record["orderId"]))] = Decimal(str(record.get("executedQty") or record.get("origQty") or "0"))
             return
