@@ -156,7 +156,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         async def account():
             return {"balances": [
                 {"asset": "USDT", "free": "100", "locked": "0"},
-                {"asset": "BTC", "free": "2", "locked": "0"},
+                {"asset": "BTC", "free": "0.02", "locked": "0"},
             ]}
 
         async def market_price(_symbol):
@@ -169,7 +169,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 "symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quoteOrderQty": "81"
             })
         await self.service._check_balance_utilization({
-            "symbol": "BTCUSDT", "side": "SELL", "type": "MARKET", "quantity": "0.001"
+            "symbol": "BTCUSDT", "side": "SELL", "type": "MARKET", "quantity": "0.02"
         })
 
     async def test_stale_market_data_rejects_buy_but_not_protective_sell(self):

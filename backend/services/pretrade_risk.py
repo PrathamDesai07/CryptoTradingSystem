@@ -72,9 +72,14 @@ class PreTradeRiskEngine:
             free = exchange_free - self._reserved.get(key, Decimal(0))
             if free <= 0:
                 raise PreTradeRiskError(f"no unreserved {asset} balance is available")
-            utilization = required / free * Decimal(100)
-            if utilization > self._maximum:
-                raise PreTradeRiskError(f"risk guard rejected order: {utilization:.2f}% of unreserved {asset} would be used (maximum {self._maximum:.2f}%)")
+            if required > free:
+                raise PreTradeRiskError(
+                    f"insufficient unreserved {asset} balance: requested {required} but only {free} is available"
+                )
+            if side == "BUY":
+                utilization = required / free * Decimal(100)
+                if utilization > self._maximum:
+                    raise PreTradeRiskError(f"risk guard rejected order: {utilization:.2f}% of unreserved {asset} would be used (maximum {self._maximum:.2f}%)")
             reservation = RiskReservation(
                 uuid4().hex, account_id, asset, required,
                 str(order.get("newClientOrderId") or ""), order["symbol"], side,
