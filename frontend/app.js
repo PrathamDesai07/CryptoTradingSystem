@@ -7,14 +7,17 @@ const socketUrl = () => {
   const url = API_BASE
     ? new URL("/ws/ticks", API_BASE)
     : new URL("../ws/ticks", window.location.href);
+  const token = getAuthToken();
+  if (token) url.searchParams.set("token", token);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url;
 };
 
 const TOKEN_KEY = "cts_token";
-const getAuthToken = () => "";
+const getAuthToken = () => window.localStorage.getItem(TOKEN_KEY) || "";
 const storeAuthToken = (token) => {
-  window.localStorage.removeItem(TOKEN_KEY);
+  if (token) window.localStorage.setItem(TOKEN_KEY, token);
+  else window.localStorage.removeItem(TOKEN_KEY);
 };
 
 const state = {

@@ -582,7 +582,7 @@ async def dashboard(request: Request) -> dict[str, object]:
 
 @websocket_router.websocket("/ws/ticks")
 async def tick_stream(websocket: WebSocket) -> None:
-    token = websocket.cookies.get("cts_session", "")
+    token = websocket.cookies.get("cts_session", "") or websocket.query_params.get("token", "")
     if not token or await asyncio.to_thread(websocket.app.state.db_handler.get_session_user, token) is None:
         await websocket.close(code=4401, reason="authentication required")
         return
