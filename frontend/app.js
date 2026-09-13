@@ -900,7 +900,8 @@ async function refreshPositions() {
   const positions = await request(`positions?symbol=${encodeURIComponent(state.selectedSymbol)}`);
   renderPositions(positions.positions);
   const history = await request(`positions/history?symbol=${encodeURIComponent(state.selectedSymbol)}&limit=50`);
-  renderClosedPositions(history.history);
+  const matches = await request(`orders/matches?symbol=${encodeURIComponent(state.selectedSymbol)}&limit=50`);
+  renderClosedPositions(history.history, matches.matches);
 }
 
 async function refreshOrderManagement() {
@@ -1074,20 +1075,29 @@ function updateLivePositionPnl(currentPrice) {
   }
 }
 
-function renderClosedPositions(items) {
+function renderClosedPositions(items, matches = []) {
   elements.closedPositionCount.textContent = items.length ? `${items.length}` : "";
-  if (!items.length) {
+  if (!items.length && !matches.length) {
     elements.closedPositionList.innerHTML = "<small>No squared-off positions yet</small>";
     return;
   }
-  elements.closedPositionList.replaceChildren(...items.map((item) => {
+  const positionRows = items.map((item) => {
     const row = document.createElement("div");
     row.className = "management-row";
     const pnl = Number(item.realized_pnl || 0);
     const closedAt = item.closed_at ? new Date(item.closed_at).toLocaleString() : "--";
     row.innerHTML = `<div><strong>Variant ${escapeHtml(item.variant)} · ${formatQuantity(item.quantity)}</strong><br><span>${escapeHtml(item.exit_reason)} · entry ${formatPrice(item.entry_price)} → exit ${formatPrice(item.exit_price)}<br>${escapeHtml(closedAt)}</span></div><span class="pnl-${pnl >= 0 ? "positive" : "negative"}">${pnl >= 0 ? "+" : ""}${formatPrice(pnl)} USDT</span>`;
     return row;
-  }));
+  });
+  const matchRows = matches.map((match) => {
+    const row = document.createElement("div");
+    row.className = "management-row";
+    const pnl = Number(match.realized_pnl || 0);
+    row.innerHTML = `<div><strong>${escapeHtml(match.entry_side)} #${escapeHtml(match.entry_order_id)} → ${escapeHtml(match.exit_side)} #${escapeHtml(match.exit_order_id)}</strong><br><span>${formatQuantity(match.quantity)} · ${formatPrice(match.entry_price)} → ${formatPrice(match.exit_price)}</span></div><span class="pnl-${pnl >= 0 ? "positive" : "negative"}">${pnl >= 0 ? "+" : ""}${formatPrice(pnl)} USDT</span>`;
+    return row;
+  });
+  elements.closedPositionCount.textContent = positionRows.length + matchRows.length ? `${positionRows.length + matchRows.length}` : "";
+  elements.closedPositionList.replaceChildren(...positionRows, ...matchRows);
 }
 
 function renderOpenOrders(orders) {

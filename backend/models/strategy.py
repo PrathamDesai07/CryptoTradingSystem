@@ -2,7 +2,7 @@
 
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .common import (
     NonNegativeDecimal,
@@ -60,6 +60,8 @@ class Position(BaseModel):
     take_profit_price: PositiveDecimal
     opened_at: UtcDateTime
     closed_at: UtcDateTime | None = None
+    entry_order_id: int | None = None
+    exit_order_ids: list[int] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_position(self) -> "Position":

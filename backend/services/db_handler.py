@@ -259,6 +259,21 @@ class DatabaseHandler:
                 recorded_at TEXT NOT NULL,
                 UNIQUE(user_id, symbol, variant, closed_at))""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_position_history_user ON position_history(user_id, symbol, closed_at DESC)")
+            db.execute(f"""CREATE TABLE IF NOT EXISTS order_matches (
+                id {history_pk},
+                user_id {reference_id} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                symbol TEXT NOT NULL,
+                entry_order_id BIGINT NOT NULL,
+                exit_order_id BIGINT NOT NULL,
+                entry_side TEXT NOT NULL,
+                exit_side TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                entry_price TEXT NOT NULL,
+                exit_price TEXT NOT NULL,
+                realized_pnl TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(user_id, entry_order_id, exit_order_id))""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_order_matches_user_time ON order_matches(user_id, recorded_at DESC)")
 
     def _delete_expired_sessions(self) -> None:
         with closing(self._connect()) as db, db:
@@ -527,6 +542,35 @@ class DatabaseHandler:
         parameters += (limit,)
         with closing(self._connect()) as db:
             rows = db.execute(statement, parameters).fetchall()
+        return [dict(zip(columns, row, strict=True)) for row in rows]
+
+    def record_order_match(self, user_id: int, match: dict[str, Any]) -> None:
+        with closing(self._connect()) as db, db:
+            db.execute(
+                """INSERT INTO order_matches(
+                       user_id, symbol, entry_order_id, exit_order_id,
+                       entry_side, exit_side, quantity, entry_price,
+                       exit_price, realized_pnl, recorded_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, entry_order_id, exit_order_id) DO NOTHING""",
+                (
+                    user_id, match["symbol"], int(match["entry_order_id"]), int(match["exit_order_id"]),
+                    match["entry_side"], match["exit_side"], str(match["quantity"]),
+                    str(match["entry_price"]), str(match["exit_price"]), str(match["realized_pnl"]),
+                    match["recorded_at"],
+                ),
+            )
+
+    def get_order_matches(self, user_id: int, symbol: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        statement = "SELECT symbol, entry_order_id, exit_order_id, entry_side, exit_side, quantity, entry_price, exit_price, realized_pnl, recorded_at FROM order_matches WHERE user_id = ?"
+        parameters: tuple[Any, ...] = (user_id,)
+        if symbol:
+            statement += " AND symbol = ?"
+            parameters += (symbol,)
+        statement += " ORDER BY recorded_at DESC LIMIT ?"
+        parameters += (limit,)
+        with closing(self._connect()) as db:
+            rows = db.execute(statement, parameters).fetchall()
+        columns = ("symbol", "entry_order_id", "exit_order_id", "entry_side", "exit_side", "quantity", "entry_price", "exit_price", "realized_pnl", "recorded_at")
         return [dict(zip(columns, row, strict=True)) for row in rows]
 
     def load_risk_reservations(self) -> list[dict[str, Any]]:

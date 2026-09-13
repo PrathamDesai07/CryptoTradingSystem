@@ -90,6 +90,8 @@ class OrderService:
         self._user_sessions: dict[int, _UserSession] = {}
         self._strategy_order_quantity = Decimal(str(settings.strategy_order_quantity))
         self._squaring_orders: set[tuple[str, int]] = set()
+        self._open_order_positions: dict[tuple[int | None, str, int], Decimal] = {}
+        self._order_matches: dict[tuple[int, int, int], dict[str, Any]] = {}
         self._reconciled_positions: set[PositionKey] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._request_latencies_ms: deque[float] = deque(maxlen=1024)
@@ -122,6 +124,10 @@ class OrderService:
                 self._positions_by_symbol.setdefault(position.symbol, set()).add(key)
                 if position.status is PositionStatus.CLOSED and hasattr(self._repository, "record_position_history"):
                     self._repository.record_position_history(user_id, position, "RESTORED")
+        if hasattr(self._repository, "get_order_matches"):
+            for user_id in {key[0] for key in self._positions if key[0] is not None}:
+                for match in self._repository.get_order_matches(user_id):
+                    self._order_matches[(user_id, int(match["entry_order_id"]), int(match["exit_order_id"]))] = match
 
     def create_background_task(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
         """Create and retain an execution task until it reaches a terminal state."""
@@ -326,6 +332,12 @@ class OrderService:
         if user_id is None or not hasattr(self._repository, "get_position_history"):
             return ()
         return tuple(await asyncio.to_thread(self._repository.get_position_history, user_id, symbol, limit))
+
+    async def order_matches(self, symbol: str | None = None, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        user_id = current_user_id.get()
+        if user_id is None or not hasattr(self._repository, "get_order_matches"):
+            return ()
+        return tuple(await asyncio.to_thread(self._repository.get_order_matches, user_id, symbol, limit))
 
     async def orders(self, symbol: str | None = None, limit: int = 100) -> tuple[dict[str, Any], ...]:
         async with self._lock:
@@ -755,9 +767,14 @@ class OrderService:
                 raise BinanceOrderError("a square-off for this order is already in flight", 409)
             self._squaring_orders.add(key)
         try:
+            user_id = current_user_id.get()
+            async with self._lock:
+                tracked_quantity = self._open_order_positions.get((user_id, symbol, order_id))
             pnl_state = await self.pnl(symbol, Decimal(0))
             pnl_order = next((item for item in pnl_state["orders"] if item["order_id"] == order_id), None)
             remaining_quantity = Decimal(0) if pnl_order is None else Decimal(pnl_order["remaining_quantity"])
+            if tracked_quantity is not None:
+                remaining_quantity = min(remaining_quantity, tracked_quantity)
             if remaining_quantity <= 0:
                 raise BinanceOrderError("this buy order has already been fully squared off", 409)
             async with self._lock:
@@ -768,7 +785,7 @@ class OrderService:
             if not source or source.get("side") != "BUY" or source.get("status") != "FILLED":
                 raise BinanceOrderError("only a filled buy order can be squared off", 422)
             sell_quantity = await self._sellable_quantity(symbol, remaining_quantity)
-            return await self.place_order({
+            response = await self.place_order({
                 "symbol": symbol,
                 "side": "SELL",
                 "type": "MARKET",
@@ -776,6 +793,8 @@ class OrderService:
                 "newClientOrderId": f"ctsSQ{order_id}"[:36],
                 "newOrderRespType": "FULL",
             })
+            await self._record_order_match(user_id, symbol, source, response)
+            return response
         finally:
             async with self._lock:
                 self._squaring_orders.discard(key)
@@ -806,7 +825,8 @@ class OrderService:
         if quantity <= 0:
             return
         stop = self._settings.variant_a_stop_loss_percent if signal.variant is StrategyVariant.A else self._settings.variant_b_stop_loss_percent
-        position = Position(symbol=signal.symbol, variant=signal.variant, status=PositionStatus.OPEN, quantity=quantity, entry_price=price, current_price=price, current_pnl=Decimal(0), stop_loss_price=price * (Decimal(1) - Decimal(str(stop)) / 100), take_profit_price=price * (Decimal(1) + Decimal(str(self._settings.take_profit_percent)) / 100), opened_at=signal.timestamp)
+        entry_order_id = int(response["orderId"]) if response.get("orderId") is not None else None
+        position = Position(symbol=signal.symbol, variant=signal.variant, status=PositionStatus.OPEN, quantity=quantity, entry_price=price, current_price=price, current_pnl=Decimal(0), stop_loss_price=price * (Decimal(1) - Decimal(str(stop)) / 100), take_profit_price=price * (Decimal(1) + Decimal(str(self._settings.take_profit_percent)) / 100), opened_at=signal.timestamp, entry_order_id=entry_order_id)
         async with self._lock:
             user_id = current_user_id.get()
             self._positions[(user_id, signal.symbol, signal.variant)] = position
@@ -836,12 +856,17 @@ class OrderService:
             if position:
                 remaining = max(Decimal(0), position.quantity - executed)
                 updated = position.model_dump()
+                exit_order_id = int(response["orderId"]) if response.get("orderId") is not None else None
+                exit_order_ids = list(position.exit_order_ids)
+                if exit_order_id is not None:
+                    exit_order_ids.append(exit_order_id)
                 updated.update(
                     current_price=price,
                     current_pnl=(price - position.entry_price) * executed,
                     quantity=remaining if remaining > 0 else position.quantity,
                     status=PositionStatus.OPEN if remaining > 0 else PositionStatus.CLOSED,
                     closed_at=None if remaining > 0 else timestamp,
+                    exit_order_ids=exit_order_ids,
                 )
                 self._positions[key] = Position.model_validate(updated)
                 saved_position = self._positions[key]
@@ -854,6 +879,12 @@ class OrderService:
                 await asyncio.to_thread(self._repository.save_user_position, key[0], saved_position)
             else:
                 await asyncio.to_thread(self._repository.save_position, saved_position)
+        if saved_position is not None and saved_position.entry_order_id is not None:
+            await self._record_order_match(
+                key[0], symbol,
+                {"orderId": saved_position.entry_order_id, "side": "BUY", "status": "FILLED", "executedQty": str(position.quantity), "price": str(position.entry_price)},
+                response,
+            )
         if (
             saved_position is not None
             and saved_position.status is PositionStatus.CLOSED
@@ -976,6 +1007,9 @@ class OrderService:
             # quantity, timestamps) without touching the process-global history.
             if hasattr(self._repository, "log_user_order"):
                 await asyncio.to_thread(self._repository.log_user_order, user_id, record, str(record.get("source") or "manual"))
+            if record.get("side") == "BUY" and record.get("status") == "FILLED" and record.get("orderId") is not None:
+                async with self._lock:
+                    self._open_order_positions[(user_id, str(record["symbol"]), int(record["orderId"]))] = Decimal(str(record.get("executedQty") or record.get("origQty") or "0"))
             return
         client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
         async with self._lock:
@@ -983,6 +1017,32 @@ class OrderService:
                 self._orders[client_id] = record
             self._history.append(record)
         await asyncio.to_thread(self._repository.save_order, record)
+
+    async def _record_order_match(self, user_id: int | None, symbol: str, entry: dict[str, Any], exit: dict[str, Any]) -> None:
+        if user_id is None or entry.get("orderId") is None or exit.get("orderId") is None:
+            return
+        quantity = Decimal(str(exit.get("executedQty") or "0"))
+        entry_quantity = Decimal(str(entry.get("executedQty") or entry.get("origQty") or quantity))
+        exit_quantity = quantity
+        entry_price = Decimal(str(entry.get("price") or "0"))
+        if entry_price <= 0 and entry_quantity:
+            entry_price = Decimal(str(entry.get("cummulativeQuoteQty", "0"))) / entry_quantity
+        exit_price = Decimal(str(exit.get("price") or "0"))
+        if exit_price <= 0 and exit_quantity:
+            exit_price = Decimal(str(exit.get("cummulativeQuoteQty", "0"))) / exit_quantity
+        if quantity <= 0 or entry_price <= 0 or exit_price <= 0:
+            return
+        match = {"symbol": symbol, "entry_order_id": int(entry["orderId"]), "exit_order_id": int(exit["orderId"]), "entry_side": str(entry.get("side") or "BUY"), "exit_side": str(exit.get("side") or "SELL"), "quantity": quantity, "entry_price": entry_price, "exit_price": exit_price, "realized_pnl": (exit_price - entry_price) * quantity, "recorded_at": datetime.now(UTC).isoformat()}
+        async with self._lock:
+            self._order_matches[(user_id, match["entry_order_id"], match["exit_order_id"])] = match
+            key = (user_id, symbol, match["entry_order_id"])
+            remaining = self._open_order_positions.get(key, entry_quantity) - quantity
+            if remaining > 0:
+                self._open_order_positions[key] = remaining
+            else:
+                self._open_order_positions.pop(key, None)
+        if hasattr(self._repository, "record_order_match"):
+            await asyncio.to_thread(self._repository.record_order_match, user_id, match)
 
     async def _signed_request(self, method: str, path: str, params: dict[str, Any]) -> Any:
         api_key, secret = self._api_key(), self._api_secret()

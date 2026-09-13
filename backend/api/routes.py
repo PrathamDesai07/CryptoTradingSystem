@@ -315,6 +315,18 @@ async def position_history(
     return {"history": items, "count": len(items)}
 
 
+@router.get("/orders/matches")
+async def order_matches(
+    request: Request,
+    symbol: str | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+    user: dict[str, object] = Depends(require_user),
+) -> dict[str, object]:
+    normalized = normalize_symbol(symbol) if symbol else None
+    items = await request.app.state.order_service.order_matches(normalized, limit)
+    return {"matches": items, "count": len(items)}
+
+
 @router.get("/order-session")
 async def order_session(request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
     """Per-account session status; keys are stored encrypted in SQLite."""

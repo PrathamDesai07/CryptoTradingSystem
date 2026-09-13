@@ -25,6 +25,7 @@ TABLES = (
     "positions",
     "risk_reservations",
     "position_history",
+    "order_matches",
 )
 
 
