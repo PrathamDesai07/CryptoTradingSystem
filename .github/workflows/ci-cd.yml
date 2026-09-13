@@ -129,20 +129,20 @@ jobs:
           ssh-private-key: ${{ secrets.PRODUCTION_SSH_KEY }}
 
       - name: Trust production server
-        run: ssh-keyscan -H 3.87.88.115 >> "$HOME/.ssh/known_hosts"
+          run: ssh-keyscan -H 3.108.255.79 >> "$HOME/.ssh/known_hosts"
 
       - name: Copy application to production server
-        run: |
-          ssh ubuntu@3.87.88.115 'mkdir -p /home/ubuntu/CryptoTradingSystem'
-          rsync --archive --compress --delete \
-            --exclude '.env' \
-            --exclude 'data/' \
-            --exclude '.git/' \
-            ./ ubuntu@3.87.88.115:/home/ubuntu/CryptoTradingSystem/
+          run: |
+            ssh ubuntu@3.108.255.79 'mkdir -p /home/ubuntu/CryptoTradingSystem'
+            rsync --archive --compress --delete \
+              --exclude '.env' \
+              --exclude 'data/' \
+              --exclude '.git/' \
+              ./ ubuntu@3.108.255.79:/home/ubuntu/CryptoTradingSystem/
 
       - name: Build and restart production container
-        run: |
-          ssh ubuntu@3.87.88.115 'bash -s' <<'REMOTE_SCRIPT'
+          run: |
+            ssh ubuntu@3.108.255.79 'bash -s' <<'REMOTE_SCRIPT'
           set -euo pipefail
           cd /home/ubuntu/CryptoTradingSystem
           test -f .env || { echo "Missing /home/ubuntu/CryptoTradingSystem/.env on production server" >&2; exit 1; }
