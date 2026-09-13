@@ -159,7 +159,11 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 {"asset": "BTC", "free": "2", "locked": "0"},
             ]}
 
+        async def market_price(_symbol):
+            return Decimal("40000")
+
         self.service.account = account
+        self.service._market_price = market_price
         with self.assertRaisesRegex(BinanceOrderError, "risk guard rejected"):
             await self.service._check_balance_utilization({
                 "symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quoteOrderQty": "81"
