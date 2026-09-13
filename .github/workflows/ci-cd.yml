@@ -133,19 +133,19 @@ jobs:
 
       - name: Copy application to production server
         run: |
-          ssh ubuntu@3.87.88.115 'mkdir -p /opt/crypto-trading-system'
+          ssh ubuntu@3.87.88.115 'mkdir -p /home/ubuntu/CryptoTradingSystem'
           rsync --archive --compress --delete \
             --exclude '.env' \
             --exclude 'data/' \
             --exclude '.git/' \
-            ./ ubuntu@3.87.88.115:/opt/crypto-trading-system/
+            ./ ubuntu@3.87.88.115:/home/ubuntu/CryptoTradingSystem/
 
       - name: Build and restart production container
         run: |
           ssh ubuntu@3.87.88.115 'bash -s' <<'REMOTE_SCRIPT'
           set -euo pipefail
-          cd /opt/crypto-trading-system
-          test -f .env || { echo "Missing /opt/crypto-trading-system/.env on production server" >&2; exit 1; }
+          cd /home/ubuntu/CryptoTradingSystem
+          test -f .env || { echo "Missing /home/ubuntu/CryptoTradingSystem/.env on production server" >&2; exit 1; }
           docker build --tag crypto-trading-system:latest .
           docker rm --force crypto-trading-system 2>/dev/null || true
           docker run --detach \

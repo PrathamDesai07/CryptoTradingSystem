@@ -145,7 +145,7 @@ Pushes to `main` run the test and container publish jobs, then deploy the
 application to the configured production server over SSH. Configure the
 GitHub Actions repository secret `PRODUCTION_SSH_KEY` with the contents of the
 server's private key. The server must have Docker, `curl`, and an existing
-`/opt/crypto-trading-system/.env` file. The deployment preserves the
+`/home/ubuntu/CryptoTradingSystem/.env` file. The deployment preserves the
 `crypto-trading-data` Docker volume and restarts the container automatically.
 
 The execution engine intentionally runs as exactly one process per database.
