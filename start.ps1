@@ -34,5 +34,6 @@ if (-not (Test-Path -LiteralPath $environmentFile)) {
     Write-Host "Created .env from .env.example. Add Binance Testnet credentials there when needed."
 }
 
-Write-Host "Starting the backend and frontend. Press Ctrl+C to stop both."
+Write-Host "Starting the backend API at http://127.0.0.1:8000. Press Ctrl+C to stop."
+Write-Host "Run .\start-frontend.ps1 in another terminal for the dashboard."
 & $pythonExecutable (Join-Path $projectRoot "backend\run.py")

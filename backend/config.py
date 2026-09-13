@@ -29,6 +29,7 @@ class Settings(BaseModel):
     app_port: int = Field(ge=1, le=65535)
     log_level: str
     api_prefix: str
+    frontend_serving_enabled: bool
     frontend_mount_path: str
     open_browser_on_start: bool
     browser_open_delay_seconds: float = Field(ge=0)

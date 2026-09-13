@@ -9,13 +9,16 @@ app_host: 127.0.0.1
 app_port: 8000
 log_level: INFO
 api_prefix: /api
+# When true the backend also serves frontend/ at frontend_mount_path. Keep
+# false to run the Vite frontend as a separate process (see start-frontend).
+frontend_serving_enabled: false
 frontend_mount_path: /dashboard
-open_browser_on_start: true
+open_browser_on_start: false
 browser_open_delay_seconds: 1
 docs_url: /docs
 redoc_url: /redoc
 cors_origins: http://localhost:3000,http://127.0.0.1:3000
-cors_allow_credentials: false
+cors_allow_credentials: true
 cors_allow_methods:
   - "*"
 cors_allow_headers:

@@ -1,4 +1,9 @@
-"""Single-process launcher for the API and its bundled frontend."""
+"""Single-process backend launcher.
+
+The API runs on its own by default; the Vite frontend is started separately
+(see ``start-frontend``). Set ``frontend_serving_enabled: true`` to also serve
+the bundled dashboard from this process.
+"""
 
 import threading
 import webbrowser
@@ -18,11 +23,11 @@ def open_dashboard(url: str, delay_seconds: float) -> None:
 
 def main() -> None:
     settings = get_settings()
-    dashboard_url = (
-        f"http://{settings.app_host}:{settings.app_port}"
-        f"{settings.frontend_mount_path}/"
-    )
-    if settings.open_browser_on_start:
+    if settings.frontend_serving_enabled and settings.open_browser_on_start:
+        dashboard_url = (
+            f"http://{settings.app_host}:{settings.app_port}"
+            f"{settings.frontend_mount_path}/"
+        )
         open_dashboard(dashboard_url, settings.browser_open_delay_seconds)
 
     uvicorn.run(

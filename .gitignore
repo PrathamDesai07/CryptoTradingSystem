@@ -170,6 +170,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Node / Vite frontend
+node_modules/
+frontend/dist/
+
 # Spyder project settings
 .spyderproject
 .spyproject

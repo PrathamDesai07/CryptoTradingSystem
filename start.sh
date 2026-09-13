@@ -26,5 +26,6 @@ if [[ ! -f "$project_root/.env" ]]; then
   echo "Created .env from .env.example. Add Binance credentials there when needed."
 fi
 
-echo "Starting the backend and frontend. Press Ctrl+C to stop both."
+echo "Starting the backend API at http://127.0.0.1:8000. Press Ctrl+C to stop."
+echo "Run ./start-frontend.sh in another terminal for the dashboard."
 exec "$python_executable" "$project_root/backend/run.py"

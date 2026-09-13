@@ -189,19 +189,24 @@ app.include_router(router, prefix=settings.api_prefix)
 app.include_router(auth_router, prefix=settings.api_prefix)
 app.include_router(websocket_router)
 
-frontend_directory = Path(__file__).resolve().parent.parent / "frontend"
-app.mount(
-    settings.frontend_mount_path,
-    StaticFiles(directory=frontend_directory, html=True),
-    name="frontend",
-)
+if settings.frontend_serving_enabled:
+    frontend_directory = Path(__file__).resolve().parent.parent / "frontend"
+    app.mount(
+        settings.frontend_mount_path,
+        StaticFiles(directory=frontend_directory, html=True),
+        name="frontend",
+    )
 
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon() -> FileResponse:
+        return FileResponse(frontend_directory / "favicon.svg", media_type="image/svg+xml")
 
-@app.get("/favicon.ico", include_in_schema=False)
-def favicon() -> FileResponse:
-    return FileResponse(frontend_directory / "favicon.svg", media_type="image/svg+xml")
+    @app.get("/")
+    def root() -> RedirectResponse:
+        return RedirectResponse(url=f"{settings.frontend_mount_path}/")
+else:
 
-
-@app.get("/")
-def root() -> RedirectResponse:
-    return RedirectResponse(url=f"{settings.frontend_mount_path}/")
+    @app.get("/")
+    def root() -> dict[str, str]:
+        """API-only mode: the Vite frontend runs as a separate process."""
+        return {"message": settings.root_message}

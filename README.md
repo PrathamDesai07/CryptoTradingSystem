@@ -48,9 +48,13 @@ backend/
     `-- __init__.py
 
 frontend/
-|-- index.html                 # Dashboard page
-|-- app.js                     # Backend API/WebSocket client
-`-- styles.css                 # Dashboard styling
+|-- index.html                 # Vite entry page
+|-- app.js                     # Backend API/WebSocket client (classic script)
+|-- config.js                  # Optional backend origin for cross-origin builds
+|-- styles.css                 # Dashboard styling
+|-- favicon.svg                # Browser icon
+|-- vite.config.js             # Vite dev server, /api+/ws proxy, build config
+`-- package.json               # Frontend dev/build scripts
 
 config.yaml                    # Runtime values and safe defaults
 .env.example                   # Secret environment-variable template
@@ -124,9 +128,16 @@ From PowerShell in the repository root, run:
 ```
 
 The launcher creates `.venv` when necessary, installs the pinned dependencies,
-creates a local `.env` from `.env.example` when missing, starts the backend, and
-opens the API-served JavaScript dashboard. The backend and frontend share one
-process, so pressing `Ctrl+C` stops the complete application.
+creates a local `.env` from `.env.example` when missing, and starts the backend
+API. The frontend runs as a separate Vite process; start it in a second terminal:
+
+```powershell
+.\start-frontend.ps1
+```
+
+The dashboard is then served at `http://localhost:3000`, and Vite proxies its
+`/api` and `/ws` requests to the backend at `http://127.0.0.1:8000`. Pressing
+`Ctrl+C` in a terminal stops only that process.
 
 The execution engine intentionally runs as exactly one process per database.
 At startup it acquires a PostgreSQL advisory lock (or a local SQLite file lock),
@@ -156,6 +167,8 @@ ignored by Git.
 - Any YAML field can be overridden with an uppercase environment variable using
   the same name, such as `APP_PORT` or `LOG_LEVEL`.
 - `CONFIG_FILE` can select a different YAML file for deployment or testing.
+- `frontend_serving_enabled` is `false` by default, so the backend is API-only;
+  set it to `true` to serve the bundled dashboard from the backend process.
 - Development is the default environment and exposes API documentation.
 - Production disables `/docs` and `/redoc` and should use an explicit
   `CORS_ORIGINS` allowlist.
@@ -377,10 +390,11 @@ misrepresented as single-order types.
 
 ### Current dashboard
 
-Start the backend and open `http://127.0.0.1:8000/dashboard/`. The backend
-serves the JavaScript application, which obtains all data through REST and
-WebSocket APIs. Binance credentials remain exclusively on the backend and are
-never included in browser responses.
+Start the backend and the frontend, then open `http://localhost:3000/`. The
+Vite dev server serves the JavaScript application and proxies its REST and
+WebSocket calls to the backend, which remains the only holder of Binance
+credentials. To serve the dashboard from the backend process instead, set
+`frontend_serving_enabled: true` and open `http://127.0.0.1:8000/dashboard/`.
 
 Current complexity characteristics:
 
@@ -579,7 +593,8 @@ docker build -t crypto-trading-system .
 docker run --rm -p 8000:8000 -v crypto-trading-data:/app/data crypto-trading-system
 ```
 
-Open `http://localhost:8000/dashboard/`. Credentials are not built into the
+The image enables bundled frontend serving, so the dashboard is available at
+`http://localhost:8000/dashboard/`. Credentials are not built into the
 image; enter Demo Mode credentials at runtime or inject them through protected
 deployment secrets. Automatic order execution remains disabled unless a valid
 runtime session is connected or the explicit execution setting is enabled.

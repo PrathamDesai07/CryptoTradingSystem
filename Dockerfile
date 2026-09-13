@@ -5,6 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     APP_ENVIRONMENT=production \
     APP_HOST=0.0.0.0 \
     APP_PORT=8000 \
+    FRONTEND_SERVING_ENABLED=true \
     OPEN_BROWSER_ON_START=false \
     STATE_DATABASE_PATH=/app/data/trading_state.db
 

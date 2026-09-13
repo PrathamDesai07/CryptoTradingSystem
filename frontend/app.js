@@ -1,7 +1,13 @@
-const apiUrl = (path) => new URL(`../api/${path}`, window.location.href);
+const API_BASE = (typeof window !== "undefined" && window.CTS_API_BASE) || "";
+const apiUrl = (path) =>
+  API_BASE
+    ? new URL(`/api/${path}`, API_BASE)
+    : new URL(`../api/${path}`, window.location.href);
 const socketUrl = () => {
-  const url = new URL("../ws/ticks", window.location.href);
-  url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const url = API_BASE
+    ? new URL("/ws/ticks", API_BASE)
+    : new URL("../ws/ticks", window.location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url;
 };
 
@@ -164,6 +170,7 @@ async function request(path, options = {}) {
     response = await fetch(apiUrl(path), {
       ...options,
       signal: controller.signal,
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
