@@ -671,9 +671,7 @@ class OrderService:
         quote_asset = rules.get("_quoteAsset", "USDT")
         notional_filter = rules.get("NOTIONAL") or rules.get("MIN_NOTIONAL") or {}
         min_notional = Decimal(str(notional_filter.get("minNotional", "0")))
-        lots: deque[dict[str, Any]] = deque()
-        realized_by_order: dict[int, Decimal] = {}
-        all_order_ids: set[int] = set()
+        orders: dict[int, dict[str, Any]] = {}
         fees_other: dict[str, Decimal] = {}
         for trade in sorted(trades, key=lambda item: (int(item.get("time", 0)), int(item.get("id", 0)))):
             quantity = Decimal(str(trade["qty"]))
@@ -681,55 +679,51 @@ class OrderService:
             commission = Decimal(str(trade.get("commission", "0")))
             commission_asset = str(trade.get("commissionAsset", ""))
             order_id = int(trade["orderId"])
-            all_order_ids.add(order_id)
             if commission_asset not in {base_asset, quote_asset} and commission > 0:
                 fees_other[commission_asset] = fees_other.get(commission_asset, Decimal(0)) + commission
-            if trade.get("isBuyer"):
-                remaining = quantity - commission if commission_asset == base_asset else quantity
-                cost = quote + commission if commission_asset == quote_asset else quote
-                while remaining > 0 and lots and lots[0]["side"] == "SELL":
-                    lot = lots[0]
-                    used = min(remaining, lot["quantity"])
-                    short_proceeds = lot["cost"] * used / lot["quantity"]
-                    buy_cost = cost * used / remaining if remaining else Decimal(0)
-                    realized_by_order[order_id] = realized_by_order.get(order_id, Decimal(0)) + short_proceeds - buy_cost
-                    lot["quantity"] -= used
-                    lot["cost"] -= short_proceeds
-                    remaining -= used
-                    if lot["quantity"] <= 0:
-                        lots.popleft()
-                if remaining > 0:
-                    lots.append({"order_id": order_id, "side": "BUY", "quantity": remaining, "cost": cost * remaining / (quantity or Decimal(1))})
+            side = "BUY" if trade.get("isBuyer") else "SELL"
+            net_quantity = quantity - commission if side == "BUY" and commission_asset == base_asset else quantity
+            quote_value = quote + commission if side == "BUY" and commission_asset == quote_asset else quote
+            if side == "SELL" and commission_asset == quote_asset:
+                quote_value -= commission
+            item = orders.setdefault(order_id, {"order_id": order_id, "side": side, "quantity": Decimal(0), "quote": Decimal(0)})
+            item["quantity"] += net_quantity
+            item["quote"] += quote_value
+
+        matches = list(self._order_matches.values())
+        user_id = current_user_id.get()
+        if user_id is not None and hasattr(self._repository, "get_order_matches"):
+            matches = await asyncio.to_thread(self._repository.get_order_matches, user_id, symbol, 1000)
+        matched_quantity: dict[int, Decimal] = {}
+        realized_by_order: dict[int, Decimal] = {}
+        realized_total = Decimal(0)
+        for match in matches:
+            if match.get("symbol") != symbol:
                 continue
-            disposed = quantity + commission if commission_asset == base_asset else quantity
-            proceeds = quote - commission if commission_asset == quote_asset else quote
-            remaining = disposed
-            while remaining > 0 and lots and lots[0]["side"] == "BUY":
-                lot = lots[0]
-                used = min(remaining, lot["quantity"])
-                matched_cost = lot["cost"] * used / lot["quantity"]
-                matched_proceeds = proceeds * used / disposed if disposed else Decimal(0)
-                realized_by_order[order_id] = realized_by_order.get(order_id, Decimal(0)) + matched_proceeds - matched_cost
-                lot["quantity"] -= used
-                lot["cost"] -= matched_cost
-                remaining -= used
-                if lot["quantity"] <= 0:
-                    lots.popleft()
-            if remaining > 0:
-                lots.append({"order_id": order_id, "side": "SELL", "quantity": remaining, "cost": proceeds * remaining / (disposed or Decimal(1))})
+            entry_id = int(match["entry_order_id"])
+            exit_id = int(match["exit_order_id"])
+            quantity = Decimal(str(match["quantity"]))
+            realized = Decimal(str(match["realized_pnl"]))
+            realized_total += realized
+            matched_quantity[entry_id] = matched_quantity.get(entry_id, Decimal(0)) + quantity
+            matched_quantity[exit_id] = matched_quantity.get(exit_id, Decimal(0)) + quantity
+            realized_by_order[entry_id] = realized_by_order.get(entry_id, Decimal(0)) + realized
+            realized_by_order[exit_id] = realized_by_order.get(exit_id, Decimal(0)) + realized
 
         unrealized_by_order: dict[int, Decimal] = {}
         remaining_by_order: dict[int, Decimal] = {}
         open_quantity = Decimal(0)
         open_cost = Decimal(0)
-        for lot in lots:
-            signed_quantity = lot["quantity"] if lot["side"] == "BUY" else -lot["quantity"]
+        for order_id, order in orders.items():
+            remaining = max(Decimal(0), order["quantity"] - matched_quantity.get(order_id, Decimal(0)))
+            average_price = order["quote"] / order["quantity"] if order["quantity"] else Decimal(0)
+            signed_quantity = remaining if order["side"] == "BUY" else -remaining
             open_quantity += signed_quantity
-            open_cost += lot["cost"] if lot["side"] == "BUY" else -lot["cost"]
-            unrealized = current_price * lot["quantity"] - lot["cost"] if lot["side"] == "BUY" else lot["cost"] - current_price * lot["quantity"]
-            unrealized_by_order[lot["order_id"]] = unrealized_by_order.get(lot["order_id"], Decimal(0)) + unrealized
-            remaining_by_order[lot["order_id"]] = remaining_by_order.get(lot["order_id"], Decimal(0)) + lot["quantity"]
-        order_ids = all_order_ids | set(realized_by_order) | set(unrealized_by_order)
+            cost = average_price * remaining
+            open_cost += cost if order["side"] == "BUY" else -cost
+            unrealized_by_order[order_id] = (current_price * remaining - cost) if order["side"] == "BUY" else (cost - current_price * remaining)
+            remaining_by_order[order_id] = remaining
+        order_ids = set(orders) | set(realized_by_order)
         return {
             "symbol": symbol,
             "method": "FIFO",
@@ -739,9 +733,9 @@ class OrderService:
             "open_quantity": open_quantity,
             "open_cost": open_cost,
             "market_value": open_quantity * current_price,
-            "realized_pnl": sum(realized_by_order.values(), Decimal(0)),
+            "realized_pnl": realized_total,
             "unrealized_pnl": open_quantity * current_price - open_cost,
-            "total_pnl": sum(realized_by_order.values(), Decimal(0)) + open_quantity * current_price - open_cost,
+            "total_pnl": realized_total + open_quantity * current_price - open_cost,
             "orders": [
                 {"order_id": order_id, "realized_pnl": realized_by_order.get(order_id), "unrealized_pnl": unrealized_by_order.get(order_id), "remaining_quantity": remaining_by_order.get(order_id, Decimal(0)), "notional": remaining_by_order.get(order_id, Decimal(0)) * current_price}
                 for order_id in sorted(order_ids)
@@ -1081,6 +1075,8 @@ class OrderService:
                 self._open_order_positions[key] = remaining
             else:
                 self._open_order_positions.pop(key, None)
+            exit_key = (user_id, symbol, match["exit_order_id"])
+            self._open_order_positions.pop(exit_key, None)
         if hasattr(self._repository, "record_order_match"):
             await asyncio.to_thread(self._repository.record_order_match, user_id, match)
 
