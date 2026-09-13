@@ -112,3 +112,55 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to production server
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Load deployment SSH key
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.PRODUCTION_SSH_KEY }}
+
+      - name: Trust production server
+        run: ssh-keyscan -H 3.87.88.115 >> "$HOME/.ssh/known_hosts"
+
+      - name: Copy application to production server
+        run: |
+          ssh ubuntu@3.87.88.115 'mkdir -p /opt/crypto-trading-system'
+          rsync --archive --compress --delete \
+            --exclude '.env' \
+            --exclude 'data/' \
+            --exclude '.git/' \
+            ./ ubuntu@3.87.88.115:/opt/crypto-trading-system/
+
+      - name: Build and restart production container
+        run: |
+          ssh ubuntu@3.87.88.115 'bash -s' <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          cd /opt/crypto-trading-system
+          test -f .env || { echo "Missing /opt/crypto-trading-system/.env on production server" >&2; exit 1; }
+          docker build --tag crypto-trading-system:latest .
+          docker rm --force crypto-trading-system 2>/dev/null || true
+          docker run --detach \
+            --name crypto-trading-system \
+            --restart unless-stopped \
+            --publish 8000:8000 \
+            --env-file .env \
+            --volume crypto-trading-data:/app/data \
+            crypto-trading-system:latest
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/api/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs crypto-trading-system
+          exit 1
+          REMOTE_SCRIPT

@@ -139,6 +139,15 @@ The dashboard is then served at `http://localhost:3000`, and Vite proxies its
 `/api` and `/ws` requests to the backend at `http://127.0.0.1:8000`. Pressing
 `Ctrl+C` in a terminal stops only that process.
 
+#### Automatic production deployment
+
+Pushes to `main` run the test and container publish jobs, then deploy the
+application to the configured production server over SSH. Configure the
+GitHub Actions repository secret `PRODUCTION_SSH_KEY` with the contents of the
+server's private key. The server must have Docker, `curl`, and an existing
+`/opt/crypto-trading-system/.env` file. The deployment preserves the
+`crypto-trading-data` Docker volume and restarts the container automatically.
+
 The execution engine intentionally runs as exactly one process per database.
 At startup it acquires a PostgreSQL advisory lock (or a local SQLite file lock),
 so an accidental multi-worker deployment fails fast instead of duplicating user
