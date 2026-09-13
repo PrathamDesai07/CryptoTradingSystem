@@ -40,13 +40,18 @@ class UpdateCredentialsRequest(BaseModel):
     api_secret: str = Field(min_length=1)
 
 
-async def _activate(db: Any, service: Any, user_id: int, api_key: str, api_secret: str) -> dict[str, Any]:
-    """Store encrypted keys, activate the in-memory session and verify online."""
-    await asyncio.to_thread(db.set_user_credentials, user_id, db.encrypt_secret(api_key), db.encrypt_secret(api_secret))
+async def _activate(db: Any, service: Any, user_id: int, api_key: str, api_secret: str, *, persist_credentials: bool = False) -> dict[str, Any]:
+    """Activate and verify credentials, optionally persisting them after verification."""
     status = await service.connect_user_credentials(user_id, api_key, api_secret)
     if status.get("verified") and status.get("can_trade"):
+        if persist_credentials:
+            await asyncio.to_thread(_persist_credentials, db, user_id, api_key, api_secret)
         await asyncio.to_thread(db.mark_credentials_verified, user_id)
     return status
+
+
+def _persist_credentials(db: Any, user_id: int, api_key: str, api_secret: str) -> None:
+    db.set_user_credentials(user_id, db.encrypt_secret(api_key), db.encrypt_secret(api_secret))
 
 
 async def _session_status(db: Any, service: Any, user_id: int) -> dict[str, Any]:
@@ -83,10 +88,15 @@ async def signup(payload: SignupRequest, request: Request, response: Response) -
     if not username or not api_key or not api_secret:
         raise HTTPException(status_code=422, detail="username and Binance Demo keys are required")
     try:
-        user_id = await asyncio.to_thread(db.create_user, username, display_name, hash_password(payload.password))
+        password_hash = await asyncio.to_thread(hash_password, payload.password)
+        user_id = await asyncio.to_thread(db.create_user, username, display_name, password_hash)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
-    status = await _activate(db, service, user_id, api_key, api_secret)
+    status = await _activate(db, service, user_id, api_key, api_secret, persist_credentials=True)
+    if not status.get("verified") or not status.get("can_trade"):
+        service.deactivate_user_session(user_id)
+        await asyncio.to_thread(db.delete_user, user_id)
+        raise HTTPException(status_code=403, detail=status.get("error") or "Binance credentials could not be verified")
     token = await asyncio.to_thread(db.create_session, user_id)
     response.set_cookie("cts_session", token, httponly=True, secure=request.app.state.settings.is_production, samesite="strict", max_age=604800, path="/")
     user = await asyncio.to_thread(db.get_user_by_id, user_id)

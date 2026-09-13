@@ -323,6 +323,11 @@ class DatabaseHandler:
             ).fetchone()
         return _user_row(row)
 
+    def delete_user(self, user_id: int) -> None:
+        """Remove a user and all dependent account data after failed signup."""
+        with closing(self._connect()) as db, db:
+            db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
     def set_user_credentials(self, user_id: int, api_key_enc: str, api_secret_enc: str) -> None:
         with closing(self._connect()) as db, db:
             db.execute(
