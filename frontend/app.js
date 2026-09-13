@@ -909,7 +909,7 @@ async function refreshPositions() {
 async function refreshOrderManagement() {
   if (!state.selectedSymbol) return;
   await refreshPositions();
-  const recent = await request(`orders?symbol=${encodeURIComponent(state.selectedSymbol)}&limit=20`);
+  const recent = await request(`orders?symbol=${encodeURIComponent(state.selectedSymbol)}&limit=100`);
   try {
     const pnl = await request(`pnl/${encodeURIComponent(state.selectedSymbol)}`);
     renderPnl(pnl);

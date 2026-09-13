@@ -656,8 +656,24 @@ class OrderService:
         return response if isinstance(response, list) else []
 
     async def account_orders(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
-        response = await self._signed_request("GET", "/api/v3/allOrders", {"symbol": symbol, "limit": limit})
-        return response if isinstance(response, list) else []
+        exchange_result, audit_result = await asyncio.gather(
+            self._signed_request("GET", "/api/v3/allOrders", {"symbol": symbol, "limit": limit}),
+            self.order_log(symbol, limit),
+        )
+        exchange_orders = exchange_result if isinstance(exchange_result, list) else []
+        merged: dict[str, dict[str, Any]] = {}
+        for item in audit_result:
+            payload = item.get("payload") if isinstance(item, dict) else None
+            order = dict(payload) if isinstance(payload, dict) else dict(item)
+            key = str(order.get("orderId") or order.get("clientOrderId") or order.get("newClientOrderId") or item.get("record_key"))
+            order.update({key_name: value for key_name, value in item.items() if key_name not in {"payload", "id", "user_id", "record_key"} and value is not None})
+            merged[key] = order
+        for order in exchange_orders:
+            key = str(order.get("orderId") or order.get("clientOrderId") or order.get("origClientOrderId"))
+            existing = merged.get(key, {})
+            existing.update(order)
+            merged[key] = existing
+        return list(merged.values())[-limit:]
 
     async def place_order_list(self, kind: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.execution_enabled:
