@@ -23,7 +23,7 @@ cors_allow_headers:
 
 binance_api_key: ${BINANCE_API_KEY:-}
 binance_api_secret: ${BINANCE_API_SECRET:-}
-binance_testnet_rest_url: https://testnet.binance.vision
+binance_testnet_rest_url: https://demo-api.binance.com
 binance_market_rest_url: https://testnet.binance.vision
 binance_market_ws_url: wss://stream.testnet.binance.vision/stream
 
@@ -80,11 +80,11 @@ order_recv_window_milliseconds: 5000
 exchange_info_cache_seconds: 3600
 # SQLite file lives under the repository db/ folder for future development.
 state_database_path: db/trading_state.db
-# Supabase PostgreSQL. Keep the password separate so reserved URL characters are
-# encoded safely by the backend. Replace these placeholders locally or set the
-# matching environment variables; never commit a real database password.
-database_url: ${DATABASE_URL:-postgresql://postgres.rbesfelvatcvyiavqqdz@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres}
-database_password: ${X5VHUrfoUIANOgFj:-}
+# Supabase PostgreSQL is optional. Leave database_url empty to use the local
+# SQLite file at state_database_path. To use Supabase, set DATABASE_URL (and
+# DATABASE_PASSWORD) in the environment or a local .env file; never commit them.
+database_url: ${DATABASE_URL:-}
+database_password: ${DATABASE_PASSWORD:-}
 fast_sma_period: 5
 slow_ema_period: 10
 strategy_signal_history_size: 200

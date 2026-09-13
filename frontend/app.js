@@ -45,6 +45,7 @@ const state = {
   credentialsConfigured: false,
   orderPnl: new Map(),
   pnlBasis: null,
+  positions: [],
   recentOrders: [],
   strategyOrderQuantity: null,
   strategyEnabled: true,
@@ -103,6 +104,8 @@ const elements = {
   submitOrder: document.querySelector("#submit-order"),
   orderMessage: document.querySelector("#order-message"),
   positionList: document.querySelector("#position-list"),
+  closedPositionList: document.querySelector("#closed-position-list"),
+  closedPositionCount: document.querySelector("#closed-position-count"),
   openOrderList: document.querySelector("#open-order-list"),
   recentOrderList: document.querySelector("#recent-order-list"),
   refreshOrders: document.querySelector("#refresh-orders"),
@@ -235,6 +238,7 @@ function queueTick(tick) {
       if (symbol === state.selectedSymbol) {
         renderMarketHeader();
         updateLivePnl(Number(latestTick.price));
+        updateLivePositionPnl(Number(latestTick.price));
       }
     }
     state.pendingTicks.clear();
@@ -881,10 +885,17 @@ elements.cancelCredentials.addEventListener("click", () => {
   elements.credentialMessage.textContent = "";
 });
 
-async function refreshOrderManagement() {
+async function refreshPositions() {
   if (!state.selectedSymbol) return;
   const positions = await request(`positions?symbol=${encodeURIComponent(state.selectedSymbol)}`);
   renderPositions(positions.positions);
+  const history = await request(`positions/history?symbol=${encodeURIComponent(state.selectedSymbol)}&limit=50`);
+  renderClosedPositions(history.history);
+}
+
+async function refreshOrderManagement() {
+  if (!state.selectedSymbol) return;
+  await refreshPositions();
   const recent = await request(`orders?symbol=${encodeURIComponent(state.selectedSymbol)}&limit=20`);
   try {
     const pnl = await request(`pnl/${encodeURIComponent(state.selectedSymbol)}`);
@@ -912,6 +923,7 @@ function renderPnl(pnl) {
     realized: Number(pnl.realized_pnl || 0),
     openQuantity: Number(pnl.open_quantity || 0),
     openCost: Number(pnl.open_cost || 0),
+    minNotional: Number(pnl.min_notional || 0),
     orders: new Map(pnl.orders.map((item) => {
       const quantity = Number(item.remaining_quantity || 0);
       const unrealized = Number(item.unrealized_pnl || 0);
@@ -968,10 +980,17 @@ function renderRecentOrders(orders) {
     const pnlText = pnlValue === null || pnlValue === undefined
       ? ""
       : ` · P&amp;L <span data-order-pnl="${escapeHtml(order.orderId)}" class="${Number(pnlValue) >= 0 ? "pnl-positive" : "pnl-negative"}">${Number(pnlValue) >= 0 ? "+" : ""}${formatPrice(pnlValue)}</span>`;
-    const squareOff = status === "FILLED" && order.side === "BUY" && Number(pnl?.remaining_quantity || 0) > 0
-      ? `<button type="button" data-close-quantity="${Number(pnl.remaining_quantity)}" data-order-id="${escapeHtml(order.orderId)}">Square off</button>`
+    const remaining = Number(pnl?.remaining_quantity || 0);
+    const minNotional = state.pnlBasis?.minNotional || 0;
+    const closed = status === "FILLED" && order.side === "BUY" && remaining > 0;
+    const squareable = closed && (!minNotional || Number(pnl?.notional || 0) >= minNotional);
+    const squareOff = squareable
+      ? `<button type="button" data-close-quantity="${remaining}" data-order-id="${escapeHtml(order.orderId)}">Square off</button>`
       : "";
-    row.innerHTML = `<div><strong>${escapeHtml(order.side)} ${escapeHtml(order.type)} · ${escapeHtml(quantity)}</strong><br><span>#${escapeHtml(identifier)}${average > 0 ? ` @ ${formatPrice(average)}` : ""}${pnlText}</span></div><div class="order-row-actions"><span class="order-status ${status.toLowerCase()}">${escapeHtml(status)}</span>${squareOff}</div>`;
+    const dust = closed && !squareable
+      ? `<span class="order-status" title="Remaining quantity is worth less than Binance's ${formatPrice(minNotional)} USDT minimum order value">Below min</span>`
+      : "";
+    row.innerHTML = `<div><strong>${escapeHtml(order.side)} ${escapeHtml(order.type)} · ${escapeHtml(quantity)}</strong><br><span>#${escapeHtml(identifier)}${average > 0 ? ` @ ${formatPrice(average)}` : ""}${pnlText}</span></div><div class="order-row-actions"><span class="order-status ${status.toLowerCase()}">${escapeHtml(status)}</span>${dust}${squareOff}</div>`;
     return row;
   }));
 }
@@ -1013,15 +1032,50 @@ elements.closeOrderTicket.addEventListener("click", closeOrderTicket);
 elements.showOrderTicket.addEventListener("click", openOrderTicket);
 
 function renderPositions(positions) {
-  const open = positions.filter((position) => position.status === "OPEN");
-  if (!open.length) {
+  state.positions = positions.filter((position) => position.status === "OPEN");
+  if (!state.positions.length) {
     elements.positionList.innerHTML = "<small>No open strategy positions</small>";
     return;
   }
-  elements.positionList.replaceChildren(...open.map((position) => {
+  elements.positionList.replaceChildren(...state.positions.map((position) => {
     const row = document.createElement("div");
     row.className = "management-row";
-    row.innerHTML = `<div><strong>Variant ${position.variant} · ${formatQuantity(position.quantity)}</strong><br><span>P&amp;L ${formatPrice(position.current_pnl)}</span></div><button type="button" data-square-off="${position.variant}">Square off</button>`;
+    row.innerHTML = `<div><strong>Variant ${position.variant} · ${formatQuantity(position.quantity)}</strong><br><span>P&amp;L <span data-position-pnl="${position.variant}"></span></span></div><button type="button" data-square-off="${position.variant}">Square off</button>`;
+    return row;
+  }));
+  updateLivePositionPnl();
+}
+
+function updateLivePositionPnl(currentPrice) {
+  if (!state.positions.length) return;
+  const tick = state.ticks.get(state.selectedSymbol);
+  const price = Number.isFinite(currentPrice)
+    ? currentPrice
+    : tick ? Number(tick.price) : NaN;
+  for (const position of state.positions) {
+    const element = elements.positionList.querySelector(`[data-position-pnl="${position.variant}"]`);
+    if (!element) continue;
+    const entry = Number(position.entry_price);
+    const quantity = Number(position.quantity);
+    const value = Number.isFinite(price) && Number.isFinite(entry) && Number.isFinite(quantity)
+      ? (price - entry) * quantity
+      : Number(position.current_pnl);
+    if (Number.isFinite(value)) setPnlValue(element, value);
+  }
+}
+
+function renderClosedPositions(items) {
+  elements.closedPositionCount.textContent = items.length ? `${items.length}` : "";
+  if (!items.length) {
+    elements.closedPositionList.innerHTML = "<small>No squared-off positions yet</small>";
+    return;
+  }
+  elements.closedPositionList.replaceChildren(...items.map((item) => {
+    const row = document.createElement("div");
+    row.className = "management-row";
+    const pnl = Number(item.realized_pnl || 0);
+    const closedAt = item.closed_at ? new Date(item.closed_at).toLocaleString() : "--";
+    row.innerHTML = `<div><strong>Variant ${escapeHtml(item.variant)} · ${formatQuantity(item.quantity)}</strong><br><span>${escapeHtml(item.exit_reason)} · entry ${formatPrice(item.entry_price)} → exit ${formatPrice(item.exit_price)}<br>${escapeHtml(closedAt)}</span></div><span class="pnl-${pnl >= 0 ? "positive" : "negative"}">${pnl >= 0 ? "+" : ""}${formatPrice(pnl)} USDT</span>`;
     return row;
   }));
 }
@@ -1312,6 +1366,7 @@ async function startDashboard() {
     });
     connectSocket();
     window.setInterval(() => loadDashboard().catch(() => setConnection(false)), state.pollSeconds * 1000);
+    window.setInterval(() => refreshPositions().catch(() => {}), state.pollSeconds * 1000);
     window.setInterval(() => loadAccountBalance().catch(() => {}), 15000);
     window.setInterval(() => loadStrategyStatus().catch(() => {}), 10000);
   } catch (error) {

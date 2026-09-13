@@ -124,6 +124,17 @@ class StrategyService:
                 if signal_symbol == normalized
             }
 
+    async def relation(self, symbol: str) -> int | None:
+        """Return the latest SMA-vs-EMA comparison, or None before enough history.
+
+        The strategy emits only on relation changes, so a restart mid-trend
+        leaves no transition to fire. This exposes the standing relation so open
+        positions can be reconciled against it.
+        """
+        normalized = symbol.strip().upper()
+        async with self._lock:
+            return self._relations.get(normalized)
+
     async def remove_symbol(self, symbol: str) -> None:
         normalized = symbol.strip().upper()
         async with self._lock:

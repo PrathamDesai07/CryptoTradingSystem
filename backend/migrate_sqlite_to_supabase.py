@@ -24,6 +24,7 @@ TABLES = (
     "orders",
     "positions",
     "risk_reservations",
+    "position_history",
 )
 
 

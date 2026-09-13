@@ -82,6 +82,7 @@ strategy_service = StrategyService(
     handle_signal,
     tick_broadcaster.publish_indicator,
 )
+order_service.set_strategy_relation_loader(strategy_service.relation)
 
 
 async def handle_candle(candle: Candle) -> None:

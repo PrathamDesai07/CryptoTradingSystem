@@ -70,7 +70,8 @@ class OrderService:
     def __init__(self, settings: Settings, repository: Any | None = None,
                  risk_engine: PreTradeRiskEngine | None = None,
                  reconciliation_service: ReconciliationService | None = None,
-                 market_tick_loader: Callable[[str], Awaitable[Tick | None]] | None = None) -> None:
+                 market_tick_loader: Callable[[str], Awaitable[Tick | None]] | None = None,
+                 strategy_relation_loader: Callable[[str], Awaitable[int | None]] | None = None) -> None:
         self._settings = settings
         self._positions: dict[PositionKey, Position] = {}
         self._positions_by_symbol: dict[str, set[PositionKey]] = {}
@@ -88,7 +89,8 @@ class OrderService:
         self._session_execution_enabled = False
         self._user_sessions: dict[int, _UserSession] = {}
         self._strategy_order_quantity = Decimal(str(settings.strategy_order_quantity))
-        self._squared_orders: set[tuple[str, int]] = set()
+        self._squaring_orders: set[tuple[str, int]] = set()
+        self._reconciled_positions: set[PositionKey] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._request_latencies_ms: deque[float] = deque(maxlen=1024)
         self._metric_counts: dict[str, int] = {"requests": 0, "errors": 0, "risk_rejections": 0, "reconciliations": 0}
@@ -103,6 +105,7 @@ class OrderService:
         )
         self._reconciliation = reconciliation_service or ReconciliationService()
         self._market_tick_loader = market_tick_loader
+        self._strategy_relation_loader = strategy_relation_loader
         for record in self._repository.load_orders():
             self._history.append(record)
             client_id = str(record.get("clientOrderId") or record.get("newClientOrderId") or "")
@@ -117,6 +120,8 @@ class OrderService:
                 key = (user_id, position.symbol, position.variant)
                 self._positions[key] = position
                 self._positions_by_symbol.setdefault(position.symbol, set()).add(key)
+                if position.status is PositionStatus.CLOSED and hasattr(self._repository, "record_position_history"):
+                    self._repository.record_position_history(user_id, position, "RESTORED")
 
     def create_background_task(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
         """Create and retain an execution task until it reaches a terminal state."""
@@ -124,6 +129,10 @@ class OrderService:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
+
+    def set_strategy_relation_loader(self, loader: Callable[[str], Awaitable[int | None]] | None) -> None:
+        """Attach the strategy's standing SMA/EMA relation lookup after construction."""
+        self._strategy_relation_loader = loader
 
     async def shutdown(self) -> None:
         """Drain submitted execution tasks before process shutdown."""
@@ -140,6 +149,9 @@ class OrderService:
         while not self._shutdown_event.is_set():
             for user_id in self.active_execution_user_ids():
                 await self._reconcile_account_reservations(user_id)
+                await self._reconcile_strategy_positions(user_id)
+            if self._settings.order_execution_enabled:
+                await self._reconcile_strategy_positions(None)
             try:
                 await asyncio.wait_for(
                     self._shutdown_event.wait(),
@@ -308,6 +320,13 @@ class OrderService:
         async with self._lock:
             return tuple(p.model_copy(deep=True) for (owner, item_symbol, _), p in self._positions.items() if owner == user_id and (symbol is None or item_symbol == symbol))
 
+    async def position_history(self, symbol: str | None = None, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        """Closed strategy positions for the bound account, newest first."""
+        user_id = current_user_id.get()
+        if user_id is None or not hasattr(self._repository, "get_position_history"):
+            return ()
+        return tuple(await asyncio.to_thread(self._repository.get_position_history, user_id, symbol, limit))
+
     async def orders(self, symbol: str | None = None, limit: int = 100) -> tuple[dict[str, Any], ...]:
         async with self._lock:
             selected = [item.copy() for item in self._history if symbol is None or item.get("symbol") == symbol]
@@ -399,11 +418,13 @@ class OrderService:
         clean = params.copy()
         audit = clean.pop("_audit", {})
         normalized = await self._normalize_order(clean)
+        rules = await self._rules(normalized["symbol"])
+        await self._enforce_min_notional(normalized, rules)
         reservation = None
         if not test:
             try:
                 await self._ensure_market_fresh(normalized)
-                reservation = await self._risk.reserve(current_user_id.get(), normalized, await self._rules(normalized["symbol"]), self.account, self._market_price)
+                reservation = await self._risk.reserve(current_user_id.get(), normalized, rules, self.account, self._market_price)
             except PreTradeRiskError as error:
                 self._metric_counts["risk_rejections"] += 1
                 raise BinanceOrderError(str(error), 422) from error
@@ -452,6 +473,34 @@ class OrderService:
                     f"risk guard rejected order: price deviation {deviation:.2f}% exceeds maximum"
                 )
 
+    async def _enforce_min_notional(self, order: dict[str, str], rules: dict[str, Any]) -> None:
+        """Reject orders valued below the symbol minimum with an actionable message.
+
+        MARKET orders carry no price, so Binance's NOTIONAL filter rejects them
+        with an opaque "Filter failure: NOTIONAL" (typically a dust remainder
+        being squared off). Price-bearing orders are already checked during
+        normalization; everything else is valued at the live market price here.
+        """
+        if "price" in order and "quantity" in order:
+            return
+        notional_filter = rules.get("NOTIONAL") or rules.get("MIN_NOTIONAL") or {}
+        minimum = Decimal(str(notional_filter.get("minNotional", "0")))
+        if minimum <= 0:
+            return
+        if "quoteOrderQty" in order:
+            notional = Decimal(order["quoteOrderQty"])
+        elif "quantity" in order:
+            notional = Decimal(order["quantity"]) * await self._market_price(order["symbol"])
+        else:
+            return
+        if notional < minimum:
+            quote = str(rules.get("_quoteAsset") or "USDT")
+            raise BinanceOrderError(
+                f"order value {format(notional.normalize(), 'f')} {quote} is below Binance's "
+                f"{format(minimum.normalize(), 'f')} {quote} minimum",
+                422,
+            )
+
     async def _check_balance_utilization(self, order: dict[str, str]) -> None:
         """Compatibility wrapper used by focused risk tests."""
         try:
@@ -482,6 +531,52 @@ class OrderService:
                 await self._risk.acknowledge(reservation, str(result.get("status") or "UNKNOWN"))
         finally:
             current_user_id.reset(token)
+
+    async def _reconcile_strategy_positions(self, user_id: int | None) -> None:
+        """Close open positions the strategy is already flat on.
+
+        The strategy emits only on SMA/EMA relation *changes* and seeding after a
+        restart deliberately suppresses signals, so a crossover that happened
+        while the process was down (or while nobody was signed in) leaves a
+        position open with nothing left to trigger an exit. This closes any open
+        position whose symbol is no longer in an uptrend, using the owner's keys.
+        """
+        if self._strategy_relation_loader is None or not self._user_execution_enabled(user_id):
+            return
+        async with self._lock:
+            candidates = [
+                key
+                for key, position in self._positions.items()
+                if key[0] == user_id
+                and position.status is PositionStatus.OPEN
+                and key not in self._inflight
+                and key not in self._reconciled_positions
+            ]
+        for key in candidates:
+            relation = await self._strategy_relation_loader(key[1])
+            if relation is None or relation > 0:
+                continue
+            token = current_user_id.set(key[0])
+            try:
+                async with self._lock:
+                    position = self._positions.get(key)
+                    if (
+                        position is None
+                        or position.status is not PositionStatus.OPEN
+                        or key in self._inflight
+                    ):
+                        continue
+                    self._inflight.add(key)
+                    self._reconciled_positions.add(key)
+                    price = position.current_price
+                await self._exit(key, price, datetime.now(UTC), ExitReason.SIGNAL)
+                logger.info("strategy_position_reconciled user=%s symbol=%s variant=%s", *key)
+            except BinanceOrderError:
+                logger.warning("strategy_position_reconcile_deferred user=%s symbol=%s variant=%s", *key)
+            finally:
+                current_user_id.reset(token)
+                async with self._lock:
+                    self._inflight.discard(key)
 
     async def query_order(self, symbol: str, order_id: int | None, client_id: str | None) -> dict[str, Any]:
         params = self._order_reference(symbol, order_id, client_id)
@@ -558,6 +653,8 @@ class OrderService:
         rules = await self._rules(symbol)
         base_asset = rules.get("_baseAsset", symbol.removesuffix("USDT"))
         quote_asset = rules.get("_quoteAsset", "USDT")
+        notional_filter = rules.get("NOTIONAL") or rules.get("MIN_NOTIONAL") or {}
+        min_notional = Decimal(str(notional_filter.get("minNotional", "0")))
         lots: deque[dict[str, Any]] = deque()
         realized_by_order: dict[int, Decimal] = {}
         fees_other: dict[str, Decimal] = {}
@@ -609,6 +706,8 @@ class OrderService:
             "symbol": symbol,
             "method": "FIFO",
             "current_price": current_price,
+            "quote_asset": quote_asset,
+            "min_notional": min_notional,
             "open_quantity": open_quantity,
             "open_cost": open_cost,
             "market_value": open_quantity * current_price,
@@ -616,7 +715,7 @@ class OrderService:
             "unrealized_pnl": open_quantity * current_price - open_cost,
             "total_pnl": sum(realized_by_order.values(), Decimal(0)) + open_quantity * current_price - open_cost,
             "orders": [
-                {"order_id": order_id, "realized_pnl": realized_by_order.get(order_id), "unrealized_pnl": unrealized_by_order.get(order_id), "remaining_quantity": remaining_by_order.get(order_id, Decimal(0))}
+                {"order_id": order_id, "realized_pnl": realized_by_order.get(order_id), "unrealized_pnl": unrealized_by_order.get(order_id), "remaining_quantity": remaining_by_order.get(order_id, Decimal(0)), "notional": remaining_by_order.get(order_id, Decimal(0)) * current_price}
                 for order_id in sorted(order_ids)
             ],
             "unconverted_commissions": fees_other,
@@ -643,25 +742,31 @@ class OrderService:
         return collected
 
     async def square_off_order(self, symbol: str, order_id: int) -> dict[str, Any]:
-        """Immediately market-sell the executed quantity of one filled buy once."""
+        """Market-sell the quantity still remaining on one filled buy order.
+
+        Whether a lot is already squared off is decided by Binance's own fill
+        ledger (via FIFO), never by remembered client state, so a partial or
+        previously-failed attempt can be retried and the answer always matches
+        the remaining quantity the dashboard displays.
+        """
         key = (symbol, order_id)
-        pnl_state = await self.pnl(symbol, Decimal(0))
-        pnl_order = next((item for item in pnl_state["orders"] if item["order_id"] == order_id), None)
-        remaining_quantity = Decimal(0) if pnl_order is None else Decimal(pnl_order["remaining_quantity"])
         async with self._lock:
-            matches = [item for item in self._history if item.get("symbol") == symbol and int(item.get("orderId", -1)) == order_id]
-            source = matches[-1] if matches else None
-        if source is None:
-            source = await self.query_order(symbol, order_id, None)
-        async with self._lock:
-            if key in self._squared_orders:
-                raise BinanceOrderError("this order has already been squared off", 409)
+            if key in self._squaring_orders:
+                raise BinanceOrderError("a square-off for this order is already in flight", 409)
+            self._squaring_orders.add(key)
+        try:
+            pnl_state = await self.pnl(symbol, Decimal(0))
+            pnl_order = next((item for item in pnl_state["orders"] if item["order_id"] == order_id), None)
+            remaining_quantity = Decimal(0) if pnl_order is None else Decimal(pnl_order["remaining_quantity"])
+            if remaining_quantity <= 0:
+                raise BinanceOrderError("this buy order has already been fully squared off", 409)
+            async with self._lock:
+                matches = [item for item in self._history if item.get("symbol") == symbol and int(item.get("orderId", -1)) == order_id]
+                source = matches[-1] if matches else None
+            if source is None:
+                source = await self.query_order(symbol, order_id, None)
             if not source or source.get("side") != "BUY" or source.get("status") != "FILLED":
                 raise BinanceOrderError("only a filled buy order can be squared off", 422)
-            if remaining_quantity <= 0:
-                raise BinanceOrderError("this buy order has no remaining quantity to square off", 409)
-            self._squared_orders.add(key)
-        try:
             sell_quantity = await self._sellable_quantity(symbol, remaining_quantity)
             return await self.place_order({
                 "symbol": symbol,
@@ -671,10 +776,9 @@ class OrderService:
                 "newClientOrderId": f"ctsSQ{order_id}"[:36],
                 "newOrderRespType": "FULL",
             })
-        except Exception:
+        finally:
             async with self._lock:
-                self._squared_orders.discard(key)
-            raise
+                self._squaring_orders.discard(key)
 
     async def square_off(self, symbol: str, variant: StrategyVariant) -> None:
         if not self.execution_enabled:
@@ -709,6 +813,7 @@ class OrderService:
             self._positions_by_symbol.setdefault(signal.symbol, set()).add(
                 (user_id, signal.symbol, signal.variant)
             )
+            self._reconciled_positions.discard((user_id, signal.symbol, signal.variant))
         if user_id is not None and hasattr(self._repository, "save_user_position"):
             await asyncio.to_thread(self._repository.save_user_position, user_id, position)
         else:
@@ -749,6 +854,13 @@ class OrderService:
                 await asyncio.to_thread(self._repository.save_user_position, key[0], saved_position)
             else:
                 await asyncio.to_thread(self._repository.save_position, saved_position)
+        if (
+            saved_position is not None
+            and saved_position.status is PositionStatus.CLOSED
+            and key[0] is not None
+            and hasattr(self._repository, "record_position_history")
+        ):
+            await asyncio.to_thread(self._repository.record_position_history, key[0], saved_position, reason.value)
 
     async def _sellable_quantity(self, symbol: str, requested: Decimal) -> Decimal:
         """Return the spendable base quantity accepted by Binance market filters.

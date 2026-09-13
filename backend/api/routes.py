@@ -302,6 +302,19 @@ async def positions(request: Request, symbol: str | None = None, user: dict[str,
     return {"positions": items, "count": len(items)}
 
 
+@router.get("/positions/history")
+async def position_history(
+    request: Request,
+    symbol: str | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+    user: dict[str, object] = Depends(require_user),
+) -> dict[str, object]:
+    """Squared-off strategy positions for the signed-in account, newest first."""
+    normalized = normalize_symbol(symbol) if symbol else None
+    items = await request.app.state.order_service.position_history(normalized, limit)
+    return {"history": items, "count": len(items)}
+
+
 @router.get("/order-session")
 async def order_session(request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
     """Per-account session status; keys are stored encrypted in SQLite."""

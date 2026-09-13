@@ -294,6 +294,9 @@ button.secondary { background:var(--surface-raised); }
 .candle-grid span { margin-bottom:3px; font-size:10px; text-transform:uppercase; }
 .chart-attribution { padding:5px 10px; }
 .chart-attribution a { color:var(--yellow); }
+.closed-positions { padding:10px 12px 14px; border-top:1px solid var(--line); background:#0d1522; }
+.closed-positions .management-list { margin-top:8px; }
+.closed-positions .ticket-heading { margin-bottom:0; }
 .book-heading { padding:10px 12px; }
 .mid-price { padding:9px 10px; background:#111814; color:var(--accent); font-size:17px; }
 .book-tables { background:var(--line); }

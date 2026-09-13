@@ -243,6 +243,22 @@ class DatabaseHandler:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL)""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_risk_reservations_account ON risk_reservations(account_id, asset)")
+            history_pk = "BIGSERIAL PRIMARY KEY" if self.is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+            db.execute(f"""CREATE TABLE IF NOT EXISTS position_history (
+                id {history_pk},
+                user_id {reference_id} NOT NULL,
+                symbol TEXT NOT NULL,
+                variant TEXT NOT NULL,
+                entry_price TEXT NOT NULL,
+                exit_price TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                realized_pnl TEXT NOT NULL,
+                exit_reason TEXT NOT NULL,
+                opened_at TEXT NOT NULL,
+                closed_at TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(user_id, symbol, variant, closed_at))""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_position_history_user ON position_history(user_id, symbol, closed_at DESC)")
 
     def _delete_expired_sessions(self) -> None:
         with closing(self._connect()) as db, db:
@@ -475,6 +491,43 @@ class DatabaseHandler:
     def save_position(self, position: Position) -> None:
         with closing(self._connect()) as db, db:
             db.execute("INSERT INTO positions(symbol, variant, payload) VALUES(?,?,?) ON CONFLICT(symbol, variant) DO UPDATE SET payload=excluded.payload", (position.symbol, position.variant.value, position.model_dump_json()))
+
+    def record_position_history(self, user_id: int, position: Position, exit_reason: str) -> None:
+        """Append one closed position to the append-only history, once."""
+        with closing(self._connect()) as db, db:
+            db.execute(
+                """INSERT INTO position_history(
+                       user_id, symbol, variant, entry_price, exit_price, quantity,
+                       realized_pnl, exit_reason, opened_at, closed_at, recorded_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING""",
+                (
+                    user_id,
+                    position.symbol,
+                    position.variant.value,
+                    str(position.entry_price),
+                    str(position.current_price),
+                    str(position.quantity),
+                    str(position.current_pnl),
+                    exit_reason,
+                    position.opened_at.isoformat(),
+                    (position.closed_at or position.opened_at).isoformat(),
+                    _now(),
+                ),
+            )
+
+    def get_position_history(self, user_id: int, symbol: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """Newest-first closed positions for one account, optionally per symbol."""
+        columns = ("symbol", "variant", "entry_price", "exit_price", "quantity", "realized_pnl", "exit_reason", "opened_at", "closed_at")
+        statement = "SELECT symbol, variant, entry_price, exit_price, quantity, realized_pnl, exit_reason, opened_at, closed_at FROM position_history WHERE user_id = ?"
+        parameters: tuple[Any, ...] = (user_id,)
+        if symbol:
+            statement += " AND symbol = ?"
+            parameters += (symbol,)
+        statement += " ORDER BY closed_at DESC LIMIT ?"
+        parameters += (limit,)
+        with closing(self._connect()) as db:
+            rows = db.execute(statement, parameters).fetchall()
+        return [dict(zip(columns, row, strict=True)) for row in rows]
 
     def load_risk_reservations(self) -> list[dict[str, Any]]:
         with closing(self._connect()) as db:
