@@ -87,7 +87,8 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         observed_user_ids = []
 
         async def place_order(params, test=False):
-            observed_user_ids.append(current_user_id.get())
+            if params["side"] == "BUY":
+                observed_user_ids.append(current_user_id.get())
             return {"executedQty": params["quantity"], "cummulativeQuoteQty": "8"}
 
         self.service.place_order = place_order

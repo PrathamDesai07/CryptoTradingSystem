@@ -61,6 +61,7 @@ class Position(BaseModel):
     opened_at: UtcDateTime
     closed_at: UtcDateTime | None = None
     entry_order_id: int | None = None
+    stop_loss_order_id: int | None = None
     exit_order_ids: list[int] = Field(default_factory=list)
 
     @model_validator(mode="after")

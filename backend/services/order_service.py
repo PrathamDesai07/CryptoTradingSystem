@@ -880,7 +880,29 @@ class OrderService:
             return
         stop = self._settings.variant_a_stop_loss_percent if signal.variant is StrategyVariant.A else self._settings.variant_b_stop_loss_percent
         entry_order_id = int(response["orderId"]) if response.get("orderId") is not None else None
-        position = Position(symbol=signal.symbol, variant=signal.variant, status=PositionStatus.OPEN, quantity=quantity, entry_price=price, current_price=price, current_pnl=Decimal(0), stop_loss_price=price * (Decimal(1) - Decimal(str(stop)) / 100), take_profit_price=price * (Decimal(1) + Decimal(str(self._settings.take_profit_percent)) / 100), opened_at=signal.timestamp, entry_order_id=entry_order_id)
+        stop_price = price * (Decimal(1) - Decimal(str(stop)) / 100)
+        try:
+            protective = await self.place_order({
+                "symbol": signal.symbol, "side": "SELL", "type": "STOP_LOSS",
+                "quantity": str(quantity), "stopPrice": str(stop_price),
+                "newClientOrderId": f"ctsSL{signal.variant.value}{signal.symbol}{entry_order_id or int(signal.timestamp.timestamp())}"[:36],
+                "newOrderRespType": "FULL",
+                "_audit": {"source": "strategy", "strategy_variant": signal.variant.value, "protective_stop": True},
+            })
+        except BinanceOrderError:
+            logger.exception("protective_stop_submit_failed symbol=%s entry_order_id=%s", signal.symbol, entry_order_id)
+            try:
+                emergency_quantity = await self._sellable_quantity(signal.symbol, quantity)
+                await self.place_order({
+                    "symbol": signal.symbol, "side": "SELL", "type": "MARKET",
+                    "quantity": str(emergency_quantity), "newOrderRespType": "FULL",
+                    "_audit": {"source": "strategy", "exit_reason": ExitReason.MANUAL.value},
+                })
+            except BinanceOrderError:
+                logger.exception("protective_stop_emergency_exit_failed symbol=%s entry_order_id=%s", signal.symbol, entry_order_id)
+            raise
+        stop_loss_order_id = int(protective["orderId"]) if protective.get("orderId") is not None else None
+        position = Position(symbol=signal.symbol, variant=signal.variant, status=PositionStatus.OPEN, quantity=quantity, entry_price=price, current_price=price, current_pnl=Decimal(0), stop_loss_price=stop_price, take_profit_price=price * (Decimal(1) + Decimal(str(self._settings.take_profit_percent)) / 100), opened_at=signal.timestamp, entry_order_id=entry_order_id, stop_loss_order_id=stop_loss_order_id)
         async with self._lock:
             user_id = current_user_id.get()
             self._positions[(user_id, signal.symbol, signal.variant)] = position
@@ -900,8 +922,10 @@ class OrderService:
                 return
             quantity = position.quantity
         _, symbol, variant = key
-        sell_quantity = await self._sellable_quantity(symbol, quantity)
-        response = await self.place_order({"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(sell_quantity), "newClientOrderId": f"cts{variant.value}{symbol}S{int(timestamp.timestamp())}"[:36], "newOrderRespType": "FULL", "_audit": {"source": "strategy", "strategy_variant": variant.value, "exit_reason": reason.value}})
+        response = await self._resolve_protective_stop(position, symbol)
+        if response is None:
+            sell_quantity = await self._sellable_quantity(symbol, quantity)
+            response = await self.place_order({"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(sell_quantity), "newClientOrderId": f"cts{variant.value}{symbol}S{int(timestamp.timestamp())}"[:36], "newOrderRespType": "FULL", "_audit": {"source": "strategy", "strategy_variant": variant.value, "exit_reason": reason.value}})
         executed, price = self._execution(response, fallback)
         if executed <= 0:
             return
@@ -921,6 +945,7 @@ class OrderService:
                     status=PositionStatus.OPEN if remaining > 0 else PositionStatus.CLOSED,
                     closed_at=None if remaining > 0 else timestamp,
                     exit_order_ids=exit_order_ids,
+                    stop_loss_order_id=None,
                 )
                 self._positions[key] = Position.model_validate(updated)
                 saved_position = self._positions[key]
@@ -946,6 +971,22 @@ class OrderService:
             and hasattr(self._repository, "record_position_history")
         ):
             await asyncio.to_thread(self._repository.record_position_history, key[0], saved_position, reason.value)
+
+    async def _resolve_protective_stop(self, position: Position, symbol: str) -> dict[str, Any] | None:
+        """Use a filled native stop, or cancel it before another exit order."""
+        if position.stop_loss_order_id is None:
+            return None
+        try:
+            existing = await self.query_order(symbol, position.stop_loss_order_id, None)
+        except BinanceOrderError:
+            existing = None
+        if existing and existing.get("status") == "FILLED":
+            return existing
+        try:
+            await self.cancel_order(symbol, position.stop_loss_order_id, None)
+        except BinanceOrderError:
+            logger.warning("protective_stop_cancel_failed symbol=%s order_id=%s", symbol, position.stop_loss_order_id)
+        return None
 
     async def _sellable_quantity(self, symbol: str, requested: Decimal) -> Decimal:
         """Return the spendable base quantity accepted by Binance market filters.

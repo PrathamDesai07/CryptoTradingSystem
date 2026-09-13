@@ -51,6 +51,7 @@ class StrategyTests(unittest.IsolatedAsyncioTestCase):
             for index, close in enumerate(("10", "9", "8", "12", "13")):
                 await strategy.process_candle(candle(index, close))
 
-            self.assertEqual(len(submitted), 2)
+            self.assertEqual(len(submitted), 4)
+            self.assertEqual({item["type"] for item in submitted}, {"MARKET", "STOP_LOSS"})
             self.assertEqual({item["_audit"]["strategy_variant"] for item in submitted}, {"A", "B"})
             self.assertTrue(all(item["_audit"]["source"] == "strategy" for item in submitted))
