@@ -69,6 +69,7 @@ class StrategyOrderQuantityRequest(BaseModel):
 
 
 class StrategyEnabledRequest(BaseModel):
+    symbol: str
     enabled: bool
 
 
@@ -128,13 +129,13 @@ async def update_strategy_order_quantity(
 
 
 @router.get("/strategy/status")
-async def strategy_status(request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
-    return request.app.state.order_service.strategy_status(int(user["id"]))
+async def strategy_status(request: Request, symbol: str, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+    return request.app.state.order_service.strategy_status(int(user["id"]), normalize_symbol(symbol))
 
 
 @router.put("/strategy/status")
 async def update_strategy_status(payload: StrategyEnabledRequest, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
-    return request.app.state.order_service.set_strategy_enabled(int(user["id"]), payload.enabled)
+    return request.app.state.order_service.set_strategy_enabled(int(user["id"]), normalize_symbol(payload.symbol), payload.enabled)
 
 
 @router.get("/symbols")

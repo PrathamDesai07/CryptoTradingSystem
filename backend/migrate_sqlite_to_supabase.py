@@ -19,6 +19,7 @@ TABLES = (
     "user_credentials",
     "sessions",
     "user_strategy_settings",
+    "user_strategy_symbols",
     "user_positions",
     "order_log",
     "orders",

@@ -204,6 +204,14 @@ class DatabaseHandler:
             db.execute(f"CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id {reference_id} NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
             db.execute(f"CREATE TABLE IF NOT EXISTS user_strategy_settings (user_id {reference_id} PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, enabled {enabled_type}, updated_at TEXT NOT NULL)")
+            db.execute(f"""CREATE TABLE IF NOT EXISTS user_strategy_symbols (
+                user_id {reference_id} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                symbol TEXT NOT NULL,
+                enabled {enabled_type},
+                expires_at TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, symbol))""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_user_strategy_symbols_expiry ON user_strategy_symbols(expires_at)")
             db.execute(f"CREATE TABLE IF NOT EXISTS user_positions (user_id {reference_id} NOT NULL REFERENCES users(id) ON DELETE CASCADE, symbol TEXT NOT NULL, variant TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, symbol, variant))")
             db.execute("""CREATE TABLE IF NOT EXISTS order_log (
                 id %s,
@@ -413,6 +421,29 @@ class DatabaseHandler:
                 "INSERT INTO user_strategy_settings(user_id, enabled, updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at",
                 (user_id, bool(enabled) if self.is_postgres else int(enabled), _now()),
             )
+
+    def get_user_strategy_symbols(self, user_id: int) -> list[dict[str, Any]]:
+        with closing(self._connect()) as db:
+            rows = db.execute("SELECT symbol, enabled, expires_at FROM user_strategy_symbols WHERE user_id = ?", (user_id,)).fetchall()
+        return [{"symbol": row[0], "enabled": bool(row[1]), "expires_at": row[2]} for row in rows]
+
+    def set_user_strategy_symbol(self, user_id: int, symbol: str, enabled: bool, expires_at: str | None) -> None:
+        with closing(self._connect()) as db, db:
+            db.execute(
+                """INSERT INTO user_strategy_symbols(user_id, symbol, enabled, expires_at, updated_at)
+                   VALUES(?,?,?,?,?) ON CONFLICT(user_id, symbol) DO UPDATE SET
+                   enabled=excluded.enabled, expires_at=excluded.expires_at, updated_at=excluded.updated_at""",
+                (user_id, symbol, bool(enabled) if self.is_postgres else int(enabled), expires_at, _now()),
+            )
+
+    def get_automated_users(self) -> list[tuple[int, str]]:
+        with closing(self._connect()) as db:
+            rows = db.execute(
+                """SELECT user_id, symbol FROM user_strategy_symbols
+                   WHERE enabled = ? AND expires_at > ?""",
+                (True if self.is_postgres else 1, _now()),
+            ).fetchall()
+        return [(int(row[0]), str(row[1])) for row in rows]
 
     def load_user_positions(self) -> list[tuple[int, Position]]:
         with closing(self._connect()) as db:

@@ -57,7 +57,7 @@ const state = {
   positions: [],
   recentOrders: [],
   strategyOrderQuantity: null,
-  strategyEnabled: true,
+  strategyEnabled: false,
 };
 const elements = {
   title: document.querySelector("#app-title"),
@@ -353,9 +353,10 @@ async function loadOrderSession() {
 }
 
 async function loadStrategyStatus() {
-  const status = await request("strategy/status");
+  if (!state.selectedSymbol) return;
+  const status = await request(`strategy/status?symbol=${encodeURIComponent(state.selectedSymbol)}`);
   state.strategyEnabled = status.enabled;
-  elements.strategyToggle.textContent = status.enabled ? "Auto trading on" : "Auto trading off";
+  elements.strategyToggle.textContent = status.enabled ? "Auto trading on · 24h" : "Auto trading off";
   elements.strategyToggle.classList.toggle("active", status.enabled);
   elements.strategyToggle.setAttribute("aria-pressed", String(status.enabled));
   const event = status.last_event;
@@ -370,7 +371,7 @@ async function loadStrategyStatus() {
 elements.strategyToggle.addEventListener("click", async () => {
   elements.strategyToggle.disabled = true;
   try {
-    await request("strategy/status", {method: "PUT", body: JSON.stringify({enabled: !state.strategyEnabled})});
+    await request("strategy/status", {method: "PUT", body: JSON.stringify({symbol: state.selectedSymbol, enabled: !state.strategyEnabled})});
     await loadStrategyStatus();
   } catch (error) {
     elements.strategyRuntimeStatus.textContent = error.message;
@@ -539,6 +540,7 @@ async function selectSymbol(symbol) {
   try {
     await loadChartCandles(symbol);
     if (state.indicatorsEnabled) await loadIndicators(symbol);
+    await loadStrategyStatus();
     await refreshOrderManagement();
   } catch (error) {
     elements.message.textContent = error.message;

@@ -3,7 +3,7 @@
 import asyncio
 from collections import deque
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 import hashlib
 import hmac
@@ -76,6 +76,7 @@ class OrderService:
         self._positions: dict[PositionKey, Position] = {}
         self._positions_by_symbol: dict[str, set[PositionKey]] = {}
         self._strategy_enabled_users: dict[int, bool] = {}
+        self._strategy_symbols: dict[tuple[int, str], datetime] = {}
         self._strategy_status: dict[int, dict[str, Any]] = {}
         self._orders: dict[str, dict[str, Any]] = {}
         self._history: deque[dict[str, Any]] = deque(maxlen=settings.strategy_signal_history_size)
@@ -275,29 +276,66 @@ class OrderService:
         finally:
             current_user_id.reset(token)
 
+    async def restore_automated_users(self) -> None:
+        if not hasattr(self._repository, "get_automated_users"):
+            return
+        for user_id, symbol in self._repository.get_automated_users():
+            rows = self._repository.get_user_strategy_symbols(user_id)
+            row = next((item for item in rows if item["symbol"] == symbol), None)
+            if not row or not row.get("expires_at"):
+                continue
+            expires_at = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+            if expires_at <= datetime.now(UTC):
+                continue
+            self._strategy_symbols[(user_id, symbol)] = expires_at
+            if user_id in self._user_sessions:
+                continue
+            stored = self._repository.get_user_credentials(user_id)
+            if stored is None:
+                continue
+            try:
+                api_key = self._repository.decrypt_secret(stored["api_key_enc"])
+                api_secret = self._repository.decrypt_secret(stored["api_secret_enc"])
+                await self.connect_user_credentials(user_id, api_key, api_secret)
+            except (ValueError, BinanceOrderError):
+                logger.warning("automated_user_restore_failed user=%s symbol=%s", user_id, symbol)
+
     def deactivate_user_session(self, user_id: int) -> None:
         """Drop the in-memory decrypted keys for an account (logout)."""
-        self._user_sessions.pop(user_id, None)
+        if not any(key[0] == user_id and expires_at > datetime.now(UTC) for key, expires_at in self._strategy_symbols.items()):
+            self._user_sessions.pop(user_id, None)
 
     def has_active_session(self, user_id: int) -> bool:
         return user_id in self._user_sessions
 
-    def active_strategy_user_ids(self) -> tuple[int, ...]:
-        """Users whose verified Demo sessions can receive automatic orders."""
-        return tuple(user_id for user_id, session in self._user_sessions.items() if session.verified and session.enabled and self._strategy_enabled_users.get(user_id, True))
+    def active_strategy_user_ids(self, symbol: str) -> tuple[int, ...]:
+        """Verified users with unexpired automation enabled for this symbol."""
+        now = datetime.now(UTC)
+        return tuple(
+            user_id for (user_id, item_symbol), expires_at in self._strategy_symbols.items()
+            if item_symbol == symbol and expires_at > now
+            and (session := self._user_sessions.get(user_id)) is not None
+            and session.verified and session.enabled
+        )
 
     def active_execution_user_ids(self) -> tuple[int, ...]:
         """All verified accounts, including those with automatic strategy disabled."""
         return tuple(user_id for user_id, session in self._user_sessions.items() if session.verified)
 
-    def strategy_status(self, user_id: int) -> dict[str, Any]:
-        return {"enabled": self._strategy_enabled_users.get(user_id, True), "last_event": self._strategy_status.get(user_id)}
+    def strategy_status(self, user_id: int, symbol: str) -> dict[str, Any]:
+        expires_at = self._strategy_symbols.get((user_id, symbol))
+        enabled = expires_at is not None and expires_at > datetime.now(UTC)
+        return {"symbol": symbol, "enabled": enabled, "expires_at": expires_at, "last_event": self._strategy_status.get(user_id)}
 
-    def set_strategy_enabled(self, user_id: int, enabled: bool) -> dict[str, Any]:
-        self._strategy_enabled_users[user_id] = enabled
-        if hasattr(self._repository, "set_user_strategy_enabled"):
-            self._repository.set_user_strategy_enabled(user_id, enabled)
-        return self.strategy_status(user_id)
+    def set_strategy_enabled(self, user_id: int, symbol: str, enabled: bool) -> dict[str, Any]:
+        expires_at = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=24) if enabled else None
+        if enabled:
+            self._strategy_symbols[(user_id, symbol)] = expires_at
+        else:
+            self._strategy_symbols.pop((user_id, symbol), None)
+        if hasattr(self._repository, "set_user_strategy_symbol"):
+            self._repository.set_user_strategy_symbol(user_id, symbol, enabled, expires_at.isoformat().replace("+00:00", "Z") if expires_at else None)
+        return self.strategy_status(user_id, symbol)
 
     def _user_execution_enabled(self, user_id: int | None) -> bool:
         if user_id is None:

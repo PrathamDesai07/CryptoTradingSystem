@@ -60,17 +60,10 @@ order_service = OrderService(
 
 async def handle_signal(signal: Signal) -> None:
     tick_broadcaster.publish_signal(signal)
-    user_ids = order_service.active_strategy_user_ids()
-    if user_ids:
-        for user_id in user_ids:
-            order_service.create_background_task(
-                order_service.process_signal_for_user(user_id, signal),
-                name=f"strategy-order-user-{user_id}-{signal.symbol}-{signal.variant.value}",
-            )
-    else:
+    for user_id in order_service.active_strategy_user_ids(signal.symbol):
         order_service.create_background_task(
-            order_service.process_signal(signal),
-            name=f"strategy-order-{signal.symbol}-{signal.variant.value}",
+            order_service.process_signal_for_user(user_id, signal),
+            name=f"strategy-order-user-{user_id}-{signal.symbol}-{signal.variant.value}",
         )
 
 
@@ -149,6 +142,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
                         symbol, settings.candle_history_bootstrap_limit
                     ),
                 )
+            await order_service.restore_automated_users()
             await market_data_client.start()
         yield
     finally:
