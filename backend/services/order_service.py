@@ -11,10 +11,9 @@ import json
 import logging
 from time import monotonic, time
 from typing import Any, Awaitable, Callable
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
+import httpx
 from pydantic import SecretStr
 
 from config import Settings
@@ -101,6 +100,8 @@ class OrderService:
         self._consecutive_order_failures = 0
         self._circuit_open_until = 0.0
         self._shutdown_event = asyncio.Event()
+        self._http_client: httpx.AsyncClient | None = None
+        self._http_client_lock = asyncio.Lock()
         self._repository = repository or StateRepository(settings.state_database_path, settings.strategy_signal_history_size)
         self._risk = risk_engine or PreTradeRiskEngine(
             Decimal(str(settings.max_order_balance_utilization_percent)),
@@ -147,6 +148,10 @@ class OrderService:
         tasks = tuple(self._background_tasks)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._http_client_lock:
+            if self._http_client is not None:
+                await self._http_client.aclose()
+                self._http_client = None
 
     def start_background_services(self) -> None:
         self._shutdown_event.clear()
@@ -1178,7 +1183,7 @@ class OrderService:
             try:
                 async with self._request_semaphore:
                     return await asyncio.wait_for(
-                        asyncio.to_thread(self._request_sync, method, path, query, api_key),
+                        self._request_async(method, path, query, api_key),
                         timeout=self._settings.order_request_timeout_seconds + 1,
                     )
             except TimeoutError as error:
@@ -1203,26 +1208,53 @@ class OrderService:
             "latency_ms": {"p50": percentile(0.50), "p95": percentile(0.95), "p99": percentile(0.99)},
         }
 
-    def _request_sync(self, method: str, path: str, query: str, api_key: str | None) -> Any:
+    async def _request_async(self, method: str, path: str, query: str, api_key: str | None) -> Any:
         url = f"{self._settings.binance_testnet_rest_url}{path}"
-        data = query.encode() if method in {"POST", "PUT"} else None
+        content = query.encode() if method in {"POST", "PUT"} else None
         if method not in {"POST", "PUT"} and query:
             url = f"{url}?{query}"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if api_key:
             headers["X-MBX-APIKEY"] = api_key
+        client = await self._get_http_client()
         try:
-            with urlopen(Request(url, data=data, headers=headers, method=method), timeout=self._settings.order_request_timeout_seconds) as response:  # noqa: S310
-                body = response.read()
-                return json.loads(body) if body else {}
-        except HTTPError as error:
-            try:
-                payload = json.loads(error.read())
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                payload = {}
-            raise BinanceOrderError(str(payload.get("msg", "Binance rejected the request")), error.code, payload.get("code")) from error
-        except (URLError, TimeoutError) as error:
+            response = await client.request(
+                method,
+                url,
+                content=content,
+                headers=headers,
+                timeout=self._settings.order_request_timeout_seconds,
+            )
+            body = response.json() if response.content else {}
+            if response.is_error:
+                raise BinanceOrderError(
+                    str(body.get("msg", "Binance rejected the request")),
+                    response.status_code,
+                    body.get("code"),
+                )
+            return body
+        except BinanceOrderError:
+            raise
+        except httpx.TimeoutException as error:
             raise BinanceOrderError("Binance request failed; reconcile by client order ID before retrying", uncertain=True) from error
+        except httpx.HTTPError as error:
+            raise BinanceOrderError("Binance request failed; reconcile by client order ID before retrying", uncertain=True) from error
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        if self._http_client is not None:
+            return self._http_client
+        async with self._http_client_lock:
+            if self._http_client is None:
+                self._http_client = httpx.AsyncClient(
+                    limits=httpx.Limits(max_connections=self._settings.max_concurrent_exchange_requests, max_keepalive_connections=16),
+                    timeout=self._settings.order_request_timeout_seconds,
+                    http2=True,
+                )
+            return self._http_client
+
+    def _request_sync(self, method: str, path: str, query: str, api_key: str | None) -> Any:
+        """Legacy compatibility shim; order traffic uses the pooled async client."""
+        raise RuntimeError("synchronous Binance requests are no longer supported")
 
     def _api_key(self) -> str:
         user_id = current_user_id.get()
