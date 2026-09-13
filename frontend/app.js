@@ -44,6 +44,7 @@ const state = {
   selectedIntervalSeconds: 60,
   lastChartBar: null,
   lastChartVolume: null,
+  chartRequestToken: 0,
   orderBookRenderIntervalMilliseconds: 500,
   pendingOrderBook: null,
   orderBookRenderTimer: null,
@@ -513,6 +514,7 @@ async function selectSymbol(symbol) {
     unsubscribeDepth(state.selectedSymbol);
   }
   state.selectedSymbol = symbol;
+  const requestToken = ++state.chartRequestToken;
   document.body.classList.add("trading-mode");
   elements.detail.hidden = false;
   elements.detailSymbol.textContent = symbol;
@@ -530,20 +532,29 @@ async function selectSymbol(symbol) {
   elements.askRows.replaceChildren();
   elements.bookMidPrice.textContent = "--";
   clearPendingOrderBook();
-  renderCandle(state.candles.get(symbol));
   if (!initializeChart()) return;
+  // Reset the chart to the incoming symbol before any live candle can merge
+  // into the previous symbol's bar. lastChartBar/lastChartVolume carry a live
+  // bar across messages, so leaving them set blends two symbols' prices into
+  // one candle and wrecks the price scale.
+  state.lastChartBar = null;
+  state.lastChartVolume = null;
   state.candleSeries.setData([]);
   state.volumeSeries.setData([]);
   state.smaSeries.setData([]);
   state.emaSeries.setData([]);
+  renderIndicatorValues({ sma: null, ema: null });
+  elements.latestSignal.textContent = "--";
+  renderCandle(state.candles.get(symbol));
   subscribeDepth(symbol);
   try {
-    await loadChartCandles(symbol);
+    await loadChartCandles(symbol, requestToken);
+    if (state.selectedSymbol !== symbol) return;
     if (state.indicatorsEnabled) await loadIndicators(symbol);
     await loadStrategyStatus();
     await refreshOrderManagement();
   } catch (error) {
-    elements.message.textContent = error.message;
+    if (state.selectedSymbol === symbol) elements.message.textContent = error.message;
   }
   elements.detail.scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -557,12 +568,23 @@ function renderCandle(candle) {
   if (candle) renderMarketHeader();
 }
 
-async function loadChartCandles(symbol) {
+async function loadChartCandles(symbol, requestToken) {
+  const interval = state.selectedInterval;
   const response = await request(
-    `chart-candles/${encodeURIComponent(symbol)}?interval=${encodeURIComponent(state.selectedInterval)}`,
+    `chart-candles/${encodeURIComponent(symbol)}?interval=${encodeURIComponent(interval)}`,
   );
+  // Discard a response that no longer matches the visible symbol, interval, or
+  // request generation: a symbol switch or timeframe click may have happened
+  // while this request was in flight. Without this a slow response repaints
+  // stale data (or the wrong interval) over the chart.
+  if (
+    state.selectedSymbol !== symbol ||
+    state.selectedInterval !== interval ||
+    requestToken !== state.chartRequestToken
+  ) {
+    return;
+  }
   const chartCandles = response.candles;
-  if (state.selectedSymbol !== symbol) return;
   const seriesData = chartCandles.map(toChartCandle);
   const volumeData = chartCandles.map(toVolumePoint);
   state.lastChartBar = seriesData.at(-1) || null;
@@ -685,6 +707,7 @@ elements.timeframeOptions.addEventListener("click", async (event) => {
   state.selectedIntervalSeconds = INTERVAL_SECONDS[state.selectedInterval] || 60;
   state.lastChartBar = null;
   state.lastChartVolume = null;
+  const requestToken = ++state.chartRequestToken;
   renderTimeframeOptions();
   if (!state.selectedSymbol || !initializeChart()) return;
   state.candleSeries.setData([]);
@@ -692,7 +715,7 @@ elements.timeframeOptions.addEventListener("click", async (event) => {
   state.smaSeries.setData([]);
   state.emaSeries.setData([]);
   try {
-    await loadChartCandles(state.selectedSymbol);
+    await loadChartCandles(state.selectedSymbol, requestToken);
   } catch (error) {
     elements.message.textContent = error.message;
   }
@@ -1003,7 +1026,15 @@ function renderRecentOrders(orders) {
     const dust = open && !squareable
       ? `<span class="order-status" title="Remaining quantity is worth less than Binance's ${formatPrice(minNotional)} USDT minimum order value">Below min</span>`
       : "";
-    row.innerHTML = `<div><strong>${escapeHtml(order.side)} ${escapeHtml(order.type)} · ${escapeHtml(quantity)}</strong><br><span>#${escapeHtml(identifier)}${average > 0 ? ` @ ${formatPrice(average)}` : ""}${pnlText}</span></div><div class="order-row-actions"><span class="order-status ${status.toLowerCase()}">${escapeHtml(status)}</span>${dust}${squareOff}</div>`;
+    const source = String(order.source || "").toLowerCase();
+    const sourceLabel = source === "strategy"
+      ? '<span class="order-status strategy" title="Placed automatically by the SMA/EMA strategy">Strategy</span>'
+      : source === "square-off"
+        ? '<span class="order-status strategy" title="Square-off order">Square-off</span>'
+        : source === "manual"
+          ? '<span class="order-status manual" title="Placed from the order ticket">Manual</span>'
+          : "";
+    row.innerHTML = `<div><strong>${escapeHtml(order.side)} ${escapeHtml(order.type)} · ${escapeHtml(quantity)}</strong><br><span>#${escapeHtml(identifier)}${average > 0 ? ` @ ${formatPrice(average)}` : ""}${pnlText}</span></div><div class="order-row-actions"><span class="order-status ${status.toLowerCase()}">${escapeHtml(status)}</span>${sourceLabel}${dust}${squareOff}</div>`;
     return row;
   }));
 }
@@ -1364,6 +1395,9 @@ elements.indicatorToggle.addEventListener("click", async () => {
 elements.closeDetail.addEventListener("click", () => {
   if (state.selectedSymbol) unsubscribeDepth(state.selectedSymbol);
   state.selectedSymbol = null;
+  state.chartRequestToken += 1;
+  state.lastChartBar = null;
+  state.lastChartVolume = null;
   clearPendingOrderBook();
   elements.detail.hidden = true;
   document.body.classList.remove("trading-mode");

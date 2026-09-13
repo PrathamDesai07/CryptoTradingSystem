@@ -304,11 +304,54 @@ class OrderService:
                 await self.connect_user_credentials(user_id, api_key, api_secret)
             except (ValueError, BinanceOrderError):
                 logger.warning("automated_user_restore_failed user=%s symbol=%s", user_id, symbol)
+        await self._restore_open_position_users()
+
+    async def _restore_open_position_users(self) -> None:
+        """Reconnect accounts that still hold open positions after a restart.
+
+        Their automation window may have lapsed while the process was down, but
+        the position still has to be squared off by the strategy, so its
+        credentials are decrypted again for the lifetime of this process.
+        """
+        for user_id in {
+            key[0]
+            for key, position in self._positions.items()
+            if key[0] is not None and position.status is PositionStatus.OPEN
+        }:
+            if user_id in self._user_sessions:
+                continue
+            stored = self._repository.get_user_credentials(user_id)
+            if stored is None:
+                continue
+            try:
+                api_key = self._repository.decrypt_secret(stored["api_key_enc"])
+                api_secret = self._repository.decrypt_secret(stored["api_secret_enc"])
+                await self.connect_user_credentials(user_id, api_key, api_secret)
+            except (ValueError, BinanceOrderError):
+                logger.warning("open_position_user_restore_failed user=%s", user_id)
 
     def deactivate_user_session(self, user_id: int) -> None:
-        """Drop the in-memory decrypted keys for an account (logout)."""
-        if not any(key[0] == user_id and expires_at > datetime.now(UTC) for key, expires_at in self._strategy_symbols.items()):
+        """Drop the in-memory decrypted keys for an account (logout).
+
+        Keys are retained while an unexpired automation window exists or the
+        account still holds open positions. Otherwise a strategy position opened
+        during automation would become impossible to square off the moment the
+        user signs out, because every automatic exit path signs requests with
+        the account's in-memory session.
+        """
+        keeps_automation = any(
+            key[0] == user_id and expires_at > datetime.now(UTC)
+            for key, expires_at in self._strategy_symbols.items()
+        )
+        if not keeps_automation and not self._has_open_positions(user_id):
             self._user_sessions.pop(user_id, None)
+
+    def _has_open_positions(self, user_id: int) -> bool:
+        """True while this account holds a position only this process can close."""
+        return any(
+            owner == user_id and position.status is PositionStatus.OPEN
+            for (owner, _, _), position in self._positions.items()
+        )
 
     def has_active_session(self, user_id: int) -> bool:
         return user_id in self._user_sessions

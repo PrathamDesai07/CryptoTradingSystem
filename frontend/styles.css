@@ -187,6 +187,8 @@ kbd { padding: 1px 4px; border: 1px solid #3b4a60; border-radius: 3px; backgroun
 .order-status { padding: 3px 6px; border-radius: 999px; color: var(--muted); background: #182438; font-size: .62rem; }
 .order-status.filled { color: var(--accent); background: rgba(57, 217, 138, .1); }
 .order-status.rejected, .order-status.canceled, .order-status.expired { color: var(--danger); background: rgba(255, 77, 109, .1); }
+.order-status.strategy { color: var(--accent); background: rgba(57, 217, 138, .1); }
+.order-status.manual { color: var(--muted); background: #182438; }
 .order-row-actions { display: flex; align-items: center; gap: 5px; }
 .order-row-actions button { white-space: nowrap; }
 

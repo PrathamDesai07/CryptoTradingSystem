@@ -459,7 +459,13 @@ class DatabaseHandler:
 
     # ------------------------------------------------------------- order audit
     def log_user_order(self, user_id: int, record: dict[str, Any], source: str = "manual") -> None:
-        """Upsert one punched order with queryable status, price, quantity, time."""
+        """Upsert one punched order with queryable status, price, quantity, time.
+
+        ``source`` is only written on first insert. Later status refreshes from
+        query/cancel paths omit it, and an order's origin never changes, so the
+        conflict update must not overwrite it (that downgraded strategy orders
+        to ``manual``).
+        """
         record_key = str(record.get("clientOrderId") or record.get("newClientOrderId") or record.get("orderId") or record.get("recordedAt"))
         recorded_at = str(record.get("recordedAt") or _now())
         executed_qty = str(record.get("executedQty") or record.get("origQty") or record.get("quantity") or "0")
@@ -482,7 +488,6 @@ class DatabaseHandler:
                        executed_qty = excluded.executed_qty,
                        avg_price = excluded.avg_price,
                        strategy_variant = excluded.strategy_variant,
-                       source = excluded.source,
                        order_time = excluded.order_time,
                        status_time = excluded.status_time,
                        recorded_at = excluded.recorded_at,
