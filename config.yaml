@@ -17,7 +17,7 @@ open_browser_on_start: false
 browser_open_delay_seconds: 1
 docs_url: /docs
 redoc_url: /redoc
-cors_origins: http://localhost:3000,http://127.0.0.1:3000
+cors_origins: http://localhost:3000,http://127.0.0.1:3000,https://crypto-trading-system-psi.vercel.app
 # Optional regex for additional trusted origins (e.g. Vercel previews). Keep the
 # default only if preview deployments need API access; otherwise set it empty and
 # list exact origins in cors_origins.
