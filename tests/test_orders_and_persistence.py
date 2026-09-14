@@ -90,7 +90,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted[0]["quantity"], "0.0002")
         position = (await self.service.positions("BTCUSDT"))[0]
         self.assertEqual(position.quantity, Decimal("0.0002"))
-        self.assertEqual(position.stop_loss_price, Decimal("36000"))
+        self.assertEqual(position.stop_loss_price, Decimal("34000"))
         self.assertEqual(position.take_profit_price, Decimal("42000"))
 
     async def test_background_strategy_signal_uses_active_user_context(self):

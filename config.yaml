@@ -95,8 +95,8 @@ fast_sma_period: 5
 slow_ema_period: 10
 strategy_signal_history_size: 200
 strategy_indicator_history_size: 500
-variant_a_stop_loss_percent: 10
-variant_b_stop_loss_percent: 15
+variant_a_stop_loss_percent: 15
+variant_b_stop_loss_percent: 10
 take_profit_percent: 5
 order_execution_enabled: false
 # Base64 Fernet key for encrypting stored user credentials. Generate one with:

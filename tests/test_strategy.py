@@ -129,8 +129,8 @@ class StrategyTests(unittest.IsolatedAsyncioTestCase):
             position_a = orders._positions[(7, "BTCUSDT", StrategyVariant.A)]
             position_b = orders._positions[(7, "BTCUSDT", StrategyVariant.B)]
             self.assertEqual(position_a.entry_price, position_b.entry_price)
-            self.assertEqual(position_a.stop_loss_price, position_a.entry_price * Decimal("0.9"))
-            self.assertEqual(position_b.stop_loss_price, position_b.entry_price * Decimal("0.85"))
+            self.assertEqual(position_a.stop_loss_price, position_a.entry_price * Decimal("0.85"))
+            self.assertEqual(position_b.stop_loss_price, position_b.entry_price * Decimal("0.9"))
             self.assertNotEqual(position_a.stop_loss_price, position_b.stop_loss_price)
             self.assertEqual(position_a.take_profit_price, position_b.take_profit_price)
             self.assertEqual(position_a.take_profit_price, position_a.entry_price * Decimal("1.05"))

@@ -183,7 +183,7 @@ keeps running on its own server:
 1. Create a Vercel project with **Root Directory** set to `frontend`. Vercel
    detects Vite, runs `npm run build`, and publishes `dist`.
 2. Add a Vercel environment variable `CTS_API_BASE` set to the backend origin,
-   for example `https://3-108-255-79.nip.io`. `vite.config.js` bakes this value
+   for example `https://demo.com`. `vite.config.js` bakes this value
    into the emitted `config.js`, so the deployed app calls that backend instead
    of its own origin. Set it for both Production and Preview when preview URLs
    are used; leaving it empty keeps same-origin URLs.
@@ -384,10 +384,11 @@ evaluation.
 - [x] Provide signed query/open-order APIs for reconciliation.
 - [x] Keep the global order-placement switch disabled by default.
 
-Important assignment clarification: it labels a 15% stop loss as tighter and a
-10% stop loss as looser. Normally, 10% is tighter because the exit is closer to
-the entry price. Until clarified, this roadmap uses Variant A = 10% and Variant
-B = 15%, while keeping both values configurable.
+Important assignment clarification: the brief's example percentages are used
+verbatim — Variant A = 15% and Variant B = 10% — while both stay configurable.
+The brief also labels the 15% stop "tighter" and the 10% stop "looser"; that is
+inverted from the usual meaning (a 10% stop exits closer to the entry price), so
+the configured values follow the brief's numbers rather than the adjectives.
 
 ### Phase 8: Binance Testnet order execution
 
