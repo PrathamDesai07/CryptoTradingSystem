@@ -18,6 +18,10 @@ browser_open_delay_seconds: 1
 docs_url: /docs
 redoc_url: /redoc
 cors_origins: http://localhost:3000,http://127.0.0.1:3000
+# Optional regex for additional trusted origins (e.g. Vercel previews). Keep the
+# default only if preview deployments need API access; otherwise set it empty and
+# list exact origins in cors_origins.
+cors_origin_regex: "${CORS_ORIGIN_REGEX:-https://[A-Za-z0-9-]+\\.vercel\\.app}"
 cors_allow_credentials: true
 cors_allow_methods:
   - "*"
@@ -32,7 +36,7 @@ binance_market_ws_url: wss://stream.testnet.binance.vision/stream
 
 trading_symbols: BTCUSDT,ETHUSDT
 market_data_enabled: true
-market_stream_suffix: "@ticker"
+market_stream_suffix: "@trade"
 order_book_stream_suffix: "@depth10@100ms"
 order_book_depth_levels: 10
 candle_history_size: 120
@@ -63,7 +67,6 @@ websocket_max_queue: 256
 frontend_tick_poll_seconds: 5
 frontend_broadcast_interval_milliseconds: 100
 order_book_render_interval_milliseconds: 500
-order_size_usdt: 10
 # Reject risk-increasing BUY orders that consume more than this share of free quote balance.
 max_order_balance_utilization_percent: 80
 # Independent fat-finger ceiling for any risk-increasing order.

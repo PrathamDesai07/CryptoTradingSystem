@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import Any
 
 from fastapi import WebSocket
 
@@ -134,7 +135,7 @@ class TickBroadcaster:
             if signals:
                 await self._broadcast_all("signals", signals)
 
-    async def _broadcast_all(self, message_type: str, items: tuple[object, ...]) -> None:
+    async def _broadcast_all(self, message_type: str, items: tuple[Any, ...]) -> None:
         clients = tuple(self._clients)
         if not clients:
             return
@@ -155,7 +156,7 @@ class TickBroadcaster:
         )
 
     async def _send_to_clients(
-        self, clients: tuple[WebSocket, ...], payload: dict[str, object]
+        self, clients: tuple[WebSocket, ...], payload: dict[str, Any]
     ) -> None:
         results = await asyncio.gather(
             *(client.send_json(payload) for client in clients),

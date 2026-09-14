@@ -10,7 +10,11 @@ Push-Location $frontendRoot
 try {
     if (-not (Test-Path -LiteralPath (Join-Path $frontendRoot "node_modules"))) {
         Write-Host "Installing frontend dependencies..."
-        npm install --include=dev
+        if (Test-Path -LiteralPath (Join-Path $frontendRoot "package-lock.json")) {
+            npm ci --include=dev
+        } else {
+            npm install --include=dev
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "Frontend dependency installation failed."
         }

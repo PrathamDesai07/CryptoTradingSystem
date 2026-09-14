@@ -44,7 +44,6 @@ backend/
     |-- order_service.py       # Binance Demo orders, risk, P&L, and order lists
     |-- pretrade_risk.py       # Atomic per-account capital reservations
     |-- reconciliation_service.py # Unknown-order reconciliation by client ID
-    |-- state_repository.py    # SQLite order/position persistence
     `-- __init__.py
 
 frontend/
@@ -98,7 +97,10 @@ python backend\migrate_sqlite_to_supabase.py
 The migration creates all application tables, copies them in foreign-key-safe order,
 resets identity sequences, and verifies row counts. It can be rerun safely.
 Preserve `db/.master_key` (or configure the same `credentials_master_key`) so
-migrated encrypted Binance credentials remain decryptable.
+migrated encrypted Binance credentials remain decryptable. If the Supabase database
+password was ever committed or shared, rotate it in the Supabase dashboard and
+update `database_password`/`DATABASE_PASSWORD` so any previously exposed copy is
+invalidated.
 
 #### Local backend setup
 
@@ -112,12 +114,15 @@ python -m venv .venv
 # .\.venv\bin\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r backend\requirements.txt
+python -m pip install -r requirements-dev.txt
 Copy-Item .env.example .env
 python -m uvicorn main:app --app-dir backend --reload
 ```
 
 The API is then available at `http://127.0.0.1:8000`. In development, its
 interactive documentation is available at `http://127.0.0.1:8000/docs`.
+`requirements-dev.txt` pins the Ruff and mypy versions used for linting and type
+checking and is optional for simply running the application.
 
 #### One-command startup
 
@@ -170,6 +175,32 @@ against Binance Spot Testnet, and decrypted only into the signed-in user's
 backend session. `.env` remains supported for unattended local testing and is
 ignored by Git.
 
+#### Deploying the frontend to Vercel
+
+The dashboard is a static Vite build, so it can be hosted on Vercel while the API
+keeps running on its own server:
+
+1. Create a Vercel project with **Root Directory** set to `frontend`. Vercel
+   detects Vite, runs `npm run build`, and publishes `dist`.
+2. Add a Vercel environment variable `CTS_API_BASE` set to the backend origin,
+   for example `https://3-108-255-79.nip.io`. `vite.config.js` bakes this value
+   into the emitted `config.js`, so the deployed app calls that backend instead
+   of its own origin. Set it for both Production and Preview when preview URLs
+   are used; leaving it empty keeps same-origin URLs.
+3. Allow the Vercel origin on the backend by setting `CORS_ORIGINS` (comma
+   separated) to the deployed domain(s), for example
+   `https://your-app.vercel.app`. The `config.yaml` default only permits
+   `localhost:3000`.
+4. The backend must be reachable over HTTPS. An `https` page cannot call an
+   `http` API (mixed content), and the WebSocket is upgraded to `wss`
+   automatically.
+
+Because the dashboard then runs cross-origin, the browser authenticates with the
+bearer token in `localStorage` rather than the `cts_session` cookie, which is
+`SameSite=Strict` and therefore not sent cross-site. Locally and in
+bundled-backend mode `CTS_API_BASE` stays empty, so same-origin URLs and the
+session cookie continue to apply.
+
 #### Configuration behavior
 
 - `config.yaml` is the source for all runtime values and defaults.
@@ -216,9 +247,12 @@ ignored by Git.
 Implementation notes:
 
 - The client uses Binance Spot's public raw stream endpoint and dynamically
-  sends `SUBSCRIBE` and `UNSUBSCRIBE` messages for `<symbol>@ticker`.
-- The displayed price is Binance's official last-trade price field (`c`), with
-  its corresponding last quantity (`Q`) and exchange event timestamp (`E`).
+  sends `SUBSCRIBE` and `UNSUBSCRIBE` messages for `<symbol>@trade`, so every
+  executed trade is ingested instead of a periodic snapshot.
+- The displayed price is Binance's official last-trade price field (`p`), with
+  its per-trade quantity (`q`) and exchange event timestamp (`T`).
+- The parser still accepts `24hrTicker` (`c`/`Q`/`E`) and book-ticker events, so
+  `market_stream_suffix` can be switched without any code change.
 - Testnet public market data requires no API credentials. Signed order
   placement is restricted to the configured official Spot Testnet host.
 - Binance symbols are lowercased only in stream names; internal symbols remain
@@ -236,12 +270,15 @@ Implementation notes:
 
 - [x] Bucket ticks by exact UTC minute boundaries.
 - [x] Set the first tick as open and update high, low, and close correctly.
-- [x] Track tick count. Volume remains unset because ticker updates are not
+- [x] Track tick count. Volume remains unset because tick counting is not
       equivalent to executed trade volume.
 - [x] Finalize each candle exactly when its minute closes.
-- [x] Prevent overlapping or duplicate candles.
-- [x] Skip empty minutes rather than fabricating candles without market data.
-- [x] Ignore ticks older than the current candle to protect finalized history.
+- [x] Prevent overlapping or duplicate candles, including a late tick arriving
+      after the boundary loop already finalized and removed the candle.
+- [x] Fill minutes that received no ticks with a flat candle carrying the
+      previous close forward, so history stays contiguous and the SMA/EMA window
+      keeps its minute alignment (matching Binance's own gap-free klines).
+- [x] Ignore ticks older than the last finalized candle to protect history.
 - [x] Store the current candle and a bounded rolling history per symbol.
 - [x] Notify API/WebSocket consumers whenever a candle changes or finalizes.
 
@@ -337,7 +374,11 @@ evaluation.
 - [x] Maintain independent positions for Variant A and Variant B.
 - [x] Record entry price, current price, quantity, and unrealized P&L.
 - [x] Calculate stop-loss and take-profit levels at entry time.
-- [x] Exit a position once its SL or TP condition is met.
+- [x] Place both protectives natively at the exchange (`STOP_LOSS` and
+      `TAKE_PROFIT` SELL orders) so they trigger even while the backend is down.
+- [x] Exit a position once its SL or TP condition is met on a streamed tick.
+- [x] Cancel the surviving protective whenever either one triggers, so a flat
+      position never keeps a live sell order behind it.
 - [x] Prevent duplicate and concurrent positions per symbol/variant.
 - [x] Open/close local state only for Binance-reported executed quantity.
 - [x] Provide signed query/open-order APIs for reconciliation.
@@ -355,6 +396,10 @@ B = 15%, while keeping both values configurable.
 - [x] Fetch and cache symbol filters such as minimum quantity, step size, and tick size.
 - [x] Normalize configured quantities and prices to exchange filters.
 - [x] Support all seven current single Spot order types and automated MARKET signals.
+- [x] Protect every automated entry with a native `STOP_LOSS` and `TAKE_PROFIT`
+      sized to the filled quantity. If the stop cannot be placed the entry is
+      unwound immediately; a missing take-profit only degrades to the
+      tick-driven software trigger, because the native stop still protects it.
 - [x] Add request timeouts and avoid unsafe order retries.
 - [x] Use deterministic strategy client order IDs to prevent
       duplicate orders.
@@ -479,7 +524,8 @@ frame uses the latest data available at that moment.
 
 - [x] Unit-test tick parsing and UTC timestamp normalization.
 - [x] Unit-test OHLC calculations and exact minute boundaries.
-- [x] Test late ticks, duplicate ticks, and symbol separation; empty minutes are intentionally skipped.
+- [x] Test late ticks (including after boundary finalization), duplicate ticks,
+      symbol separation, and empty-minute gap filling.
 - [x] Unit-test SMA/EMA calculations and crossover signals.
 - [x] Unit-test FIFO P&L, commissions, kill switch, and duplicate prevention paths.
 - [x] Mock Binance REST responses for deterministic order and P&L tests.
@@ -527,7 +573,11 @@ Invoke-RestMethod "http://127.0.0.1:8000/api/pnl/BTCUSDT"
 
 WebSocket clients connect to `ws://127.0.0.1:8000/ws/ticks` and can request
 depth with `{"action":"subscribe_depth","symbol":"BTCUSDT"}` or release it
-with the corresponding `unsubscribe_depth` action.
+with the corresponding `unsubscribe_depth` action. When the dashboard is served
+same-origin (`window.CTS_API_BASE` left empty) the browser authenticates the
+socket with the `cts_session` HttpOnly cookie, so no token is placed in the URL;
+a cross-origin build instead appends its bearer token as a `token` query
+parameter.
 
 Run the complete offline test suite:
 
@@ -535,6 +585,17 @@ Run the complete offline test suite:
 $env:PYTHONPATH = "backend"
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+Lint and type-check the backend with the same commands CI runs:
+
+```powershell
+.\.venv\Scripts\python.exe -m ruff check backend tests
+.\.venv\Scripts\python.exe -m mypy backend
+```
+
+Both tools read `pyproject.toml`: Ruff is configured with a conservative rule
+set at a 120-column limit, and mypy resolves the `backend` package via
+`mypy_path`.
 
 ## Known limitations
 

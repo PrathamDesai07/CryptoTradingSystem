@@ -29,7 +29,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 try:
     import psycopg
 except ImportError:  # SQLite-only development and unit-test installs remain usable.
-    psycopg = None
+    psycopg = None  # type: ignore[assignment]
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -147,7 +147,7 @@ class DatabaseHandler:
             else:
                 import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
         except (OSError, BlockingIOError):
             handle.close()
             return False
@@ -170,7 +170,7 @@ class DatabaseHandler:
                 else:
                     import fcntl
 
-                    fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(lease.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
             finally:
                 lease.close()
             return
@@ -187,6 +187,8 @@ class DatabaseHandler:
         if self.is_postgres:
             if psycopg is None:
                 raise RuntimeError("PostgreSQL configured but psycopg is not installed")
+            if self.database_url is None:
+                raise RuntimeError("PostgreSQL connection URL is not configured")
             return _PostgresConnection(psycopg.connect(self.database_url))
         connection = sqlite3.connect(self.path, timeout=5)
         connection.execute("PRAGMA journal_mode=WAL")

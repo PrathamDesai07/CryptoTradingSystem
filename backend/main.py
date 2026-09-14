@@ -174,7 +174,7 @@ app.state.db_handler = db_handler
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
-    allow_origin_regex=r"https://[A-Za-z0-9-]+\.vercel\.app",
+    allow_origin_regex=settings.cors_origin_regex or None,
     allow_credentials=settings.cors_allow_credentials,
     allow_methods=settings.cors_allow_methods,
     allow_headers=settings.cors_allow_headers,
@@ -202,6 +202,6 @@ if settings.frontend_serving_enabled:
 else:
 
     @app.get("/")
-    def root() -> dict[str, str]:
+    def root() -> dict[str, str]:  # type: ignore[misc]
         """API-only mode: the Vite frontend runs as a separate process."""
         return {"message": settings.root_message}

@@ -3,6 +3,7 @@
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -116,7 +117,7 @@ async def public_config(request: Request) -> dict[str, object]:
 
 @router.put("/strategy/order-quantity")
 async def update_strategy_order_quantity(
-    payload: StrategyOrderQuantityRequest, request: Request, user: dict[str, object] = Depends(require_user)
+    payload: StrategyOrderQuantityRequest, request: Request, user: dict[str, Any] = Depends(require_user)
 ) -> dict[str, object]:
     """Change sizing for future automatic strategy orders in this process."""
     try:
@@ -129,12 +130,12 @@ async def update_strategy_order_quantity(
 
 
 @router.get("/strategy/status")
-async def strategy_status(request: Request, symbol: str, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def strategy_status(request: Request, symbol: str, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     return request.app.state.order_service.strategy_status(int(user["id"]), normalize_symbol(symbol))
 
 
 @router.put("/strategy/status")
-async def update_strategy_status(payload: StrategyEnabledRequest, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def update_strategy_status(payload: StrategyEnabledRequest, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     return request.app.state.order_service.set_strategy_enabled(int(user["id"]), normalize_symbol(payload.symbol), payload.enabled)
 
 
@@ -144,7 +145,7 @@ async def list_symbols(request: Request) -> dict[str, object]:
 
 
 @router.post("/symbols", status_code=201)
-async def add_symbol(payload: SymbolRequest, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def add_symbol(payload: SymbolRequest, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         symbol = normalize_symbol(payload.symbol)
         added = await request.app.state.market_data_client.add_symbol(symbol)
@@ -169,7 +170,7 @@ async def add_symbol(payload: SymbolRequest, request: Request, user: dict[str, o
 
 
 @router.delete("/symbols/{symbol}")
-async def remove_symbol(symbol: str, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def remove_symbol(symbol: str, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         normalized = normalize_symbol(symbol)
         removed = await request.app.state.market_data_client.remove_symbol(normalized)
@@ -297,7 +298,7 @@ async def signals(
 
 
 @router.get("/positions")
-async def positions(request: Request, symbol: str | None = None, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def positions(request: Request, symbol: str | None = None, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     normalized = normalize_symbol(symbol) if symbol else None
     items = await request.app.state.order_service.positions(normalized)
     return {"positions": items, "count": len(items)}
@@ -308,7 +309,7 @@ async def position_history(
     request: Request,
     symbol: str | None = None,
     limit: int = Query(default=100, ge=1, le=1000),
-    user: dict[str, object] = Depends(require_user),
+    user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, object]:
     """Squared-off strategy positions for the signed-in account, newest first."""
     normalized = normalize_symbol(symbol) if symbol else None
@@ -321,7 +322,7 @@ async def order_matches(
     request: Request,
     symbol: str | None = None,
     limit: int = Query(default=100, ge=1, le=1000),
-    user: dict[str, object] = Depends(require_user),
+    user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, object]:
     normalized = normalize_symbol(symbol) if symbol else None
     items = await request.app.state.order_service.order_matches(normalized, limit)
@@ -329,7 +330,7 @@ async def order_matches(
 
 
 @router.get("/order-session")
-async def order_session(request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def order_session(request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     """Per-account session status; keys are stored encrypted in SQLite."""
     db = request.app.state.db_handler
     service = request.app.state.order_service
@@ -346,7 +347,7 @@ async def order_session(request: Request, user: dict[str, object] = Depends(requ
 
 
 @router.post("/order-session")
-async def connect_order_session(payload: RuntimeCredentialsRequest, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def connect_order_session(payload: RuntimeCredentialsRequest, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     """Replace this account's stored keys and reconnect the live session."""
     db = request.app.state.db_handler
     service = request.app.state.order_service
@@ -365,13 +366,13 @@ async def connect_order_session(payload: RuntimeCredentialsRequest, request: Req
 
 
 @router.delete("/order-session")
-async def disconnect_order_session(request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def disconnect_order_session(request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     request.app.state.order_service.deactivate_user_session(int(user["id"]))
     return {"connected": False, "storage": "encrypted_database"}
 
 
 @router.post("/positions/{symbol}/{variant}/square-off")
-async def square_off(symbol: str, variant: StrategyVariant, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def square_off(symbol: str, variant: StrategyVariant, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         await request.app.state.order_service.square_off(normalize_symbol(symbol), variant)
     except BinanceOrderError as error:
@@ -380,7 +381,7 @@ async def square_off(symbol: str, variant: StrategyVariant, request: Request, us
 
 
 @router.get("/pnl/{symbol}")
-async def pnl(symbol: str, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def pnl(symbol: str, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     normalized = normalize_symbol(symbol)
     tick = await request.app.state.tick_store.get(normalized)
     if tick is None:
@@ -392,7 +393,7 @@ async def pnl(symbol: str, request: Request, user: dict[str, object] = Depends(r
 
 
 @router.post("/orders/{symbol}/{order_id}/square-off")
-async def square_off_order(symbol: str, order_id: int, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def square_off_order(symbol: str, order_id: int, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     normalized = normalize_symbol(symbol)
     try:
         service = request.app.state.order_service
@@ -430,7 +431,7 @@ async def local_orders(
     start_time: datetime | None = None,
     end_time: datetime | None = None,
     limit: int = Query(default=100, ge=1, le=1000),
-    user: dict[str, object] = Depends(require_user),
+    user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, object]:
     normalized = normalize_symbol(symbol) if symbol else None
     if any(value is not None and value.tzinfo is None for value in (start_time, end_time)):
@@ -470,7 +471,7 @@ async def local_orders(
 
 
 @router.post("/orders")
-async def create_order(payload: SpotOrderRequest, request: Request, test: bool = False, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def create_order(payload: SpotOrderRequest, request: Request, test: bool = False, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         result = await request.app.state.order_service.place_order(payload.model_dump(exclude_none=True), test)
     except BinanceOrderError as error:
@@ -479,7 +480,7 @@ async def create_order(payload: SpotOrderRequest, request: Request, test: bool =
 
 
 @router.get("/orders/open")
-async def open_orders(request: Request, symbol: str | None = None, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def open_orders(request: Request, symbol: str | None = None, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         items = await request.app.state.order_service.open_orders(normalize_symbol(symbol) if symbol else None)
     except BinanceOrderError as error:
@@ -488,7 +489,7 @@ async def open_orders(request: Request, symbol: str | None = None, user: dict[st
 
 
 @router.post("/order-lists")
-async def create_order_list(payload: OrderListRequest, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def create_order_list(payload: OrderListRequest, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         result = await request.app.state.order_service.place_order_list(payload.type, payload.parameters)
     except BinanceOrderError as error:
@@ -497,7 +498,7 @@ async def create_order_list(payload: OrderListRequest, request: Request, user: d
 
 
 @router.get("/order-lists")
-async def order_lists(request: Request, open_only: bool = True, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def order_lists(request: Request, open_only: bool = True, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         items = await request.app.state.order_service.order_lists(open_only)
     except BinanceOrderError as error:
@@ -506,7 +507,7 @@ async def order_lists(request: Request, open_only: bool = True, user: dict[str, 
 
 
 @router.get("/order-lists/status")
-async def order_list_status(request: Request, order_list_id: int | None = None, client_order_id: str | None = None, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def order_list_status(request: Request, order_list_id: int | None = None, client_order_id: str | None = None, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         result = await request.app.state.order_service.query_order_list(order_list_id, client_order_id)
     except BinanceOrderError as error:
@@ -515,7 +516,7 @@ async def order_list_status(request: Request, order_list_id: int | None = None, 
 
 
 @router.delete("/order-lists")
-async def cancel_order_list(payload: OrderReferenceRequest, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def cancel_order_list(payload: OrderReferenceRequest, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         result = await request.app.state.order_service.cancel_order_list(normalize_symbol(payload.symbol), payload.order_id, payload.client_order_id)
     except BinanceOrderError as error:
@@ -524,7 +525,7 @@ async def cancel_order_list(payload: OrderReferenceRequest, request: Request, us
 
 
 @router.get("/orders/status")
-async def order_status(request: Request, symbol: str, order_id: int | None = None, client_order_id: str | None = None, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def order_status(request: Request, symbol: str, order_id: int | None = None, client_order_id: str | None = None, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         result = await request.app.state.order_service.query_order(normalize_symbol(symbol), order_id, client_order_id)
     except BinanceOrderError as error:
@@ -533,7 +534,7 @@ async def order_status(request: Request, symbol: str, order_id: int | None = Non
 
 
 @router.delete("/orders")
-async def cancel_order(payload: OrderReferenceRequest, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def cancel_order(payload: OrderReferenceRequest, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         result = await request.app.state.order_service.cancel_order(normalize_symbol(payload.symbol), payload.order_id, payload.client_order_id)
     except BinanceOrderError as error:
@@ -542,7 +543,7 @@ async def cancel_order(payload: OrderReferenceRequest, request: Request, user: d
 
 
 @router.delete("/orders/open/{symbol}")
-async def cancel_all_orders(symbol: str, request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def cancel_all_orders(symbol: str, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         items = await request.app.state.order_service.cancel_all(normalize_symbol(symbol))
     except BinanceOrderError as error:
@@ -551,7 +552,7 @@ async def cancel_all_orders(symbol: str, request: Request, user: dict[str, objec
 
 
 @router.get("/account")
-async def account(request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def account(request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     try:
         return {"account": await request.app.state.order_service.account()}
     except BinanceOrderError as error:
@@ -559,7 +560,7 @@ async def account(request: Request, user: dict[str, object] = Depends(require_us
 
 
 @router.get("/execution/metrics")
-async def execution_metrics(request: Request, user: dict[str, object] = Depends(require_user)) -> dict[str, object]:
+async def execution_metrics(request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, object]:
     """Bounded in-process execution telemetry for operational review."""
     return request.app.state.order_service.metrics()
 

@@ -7,7 +7,9 @@ const socketUrl = () => {
   const url = API_BASE
     ? new URL("/ws/ticks", API_BASE)
     : new URL("../ws/ticks", window.location.href);
-  const token = getAuthToken();
+  // Same-origin (empty API_BASE) authenticates through the HttpOnly session
+  // cookie, so the token is only appended when a cross-origin backend is used.
+  const token = API_BASE ? getAuthToken() : "";
   if (token) url.searchParams.set("token", token);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url;
@@ -30,6 +32,8 @@ const state = {
   pollSeconds: 5,
   candles: new Map(),
   socket: null,
+  reconnectTimer: null,
+  pollTimers: [],
   selectedSymbol: null,
   chart: null,
   candleSeries: null,
@@ -199,6 +203,7 @@ async function request(path, options = {}) {
   );
   if (isApplicationAuthFailure && token) {
     storeAuthToken("");
+    stopDashboard();
     showAuthGate("login", "Your session expired. Sign in again.");
   }
   if (!response.ok) throw new Error(detail || `Request failed: ${response.status}`);
@@ -211,7 +216,7 @@ function ensureTickCard(symbol) {
   card = document.createElement("article");
   card.className = "tick-card";
   card.innerHTML = `
-    <div><strong class="symbol"></strong><button class="remove" data-symbol="${symbol}" aria-label="Remove ${symbol}">Remove</button></div>
+    <div><strong class="symbol"></strong><button class="remove" data-symbol="${escapeAttr(symbol)}" aria-label="Remove ${escapeAttr(symbol)}">Remove</button></div>
     <p class="price">Waiting...</p>
     <small>No update received</small>`;
   card.querySelector(".symbol").textContent = symbol;
@@ -233,6 +238,12 @@ function updateTickCard(symbol) {
 
 function renderTickSnapshot() {
   elements.symbolCount.textContent = state.symbols.size;
+  for (const symbol of Array.from(state.cards.keys())) {
+    if (!state.symbols.has(symbol)) {
+      state.cards.get(symbol).remove();
+      state.cards.delete(symbol);
+    }
+  }
   for (const symbol of state.symbols) updateTickCard(symbol);
   if (state.selectedSymbol) renderMarketTabs();
 }
@@ -263,7 +274,11 @@ function renderFeatures(features) {
   for (const [name, status] of Object.entries(features)) {
     const item = document.createElement("div");
     item.className = `feature ${status}`;
-    item.innerHTML = `<span>${name.replaceAll("_", " ")}</span><strong>${status}</strong>`;
+    const label = document.createElement("span");
+    label.textContent = name.replaceAll("_", " ");
+    const value = document.createElement("strong");
+    value.textContent = status;
+    item.append(label, value);
     elements.featureGrid.append(item);
   }
 }
@@ -275,8 +290,17 @@ function setConnection(connected) {
 
 async function loadDashboard() {
   const data = await request("dashboard");
-  state.symbols = new Set(data.symbols);
-  state.ticks = new Map(Object.entries(data.ticks));
+  const symbols = new Set(data.symbols);
+  for (const symbol of symbols) {
+    const tick = data.ticks[symbol];
+    if (!tick) continue;
+    const existing = state.ticks.get(symbol);
+    // Do not let the slower poll overwrite a newer WebSocket tick.
+    if (!existing || new Date(tick.timestamp) >= new Date(existing.timestamp)) {
+      state.ticks.set(symbol, tick);
+    }
+  }
+  state.symbols = symbols;
   state.candles = new Map(Object.entries(data.candles));
   elements.stream.textContent = data.health.binance_connected ? "Connected" : "Disconnected";
   elements.lastUpdate.textContent = data.health.last_message_at
@@ -417,6 +441,8 @@ function renderOrderSession() {
 }
 
 function connectSocket() {
+  window.clearTimeout(state.reconnectTimer);
+  state.reconnectTimer = null;
   const socket = new WebSocket(socketUrl());
   state.socket = socket;
   socket.addEventListener("open", () => {
@@ -425,34 +451,42 @@ function connectSocket() {
     if (state.selectedSymbol) subscribeDepth(state.selectedSymbol);
   });
   socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch (_) {
+      return;
+    }
+    if (!message || typeof message !== "object") return;
+    const data = Array.isArray(message.data) ? message.data : [];
     if (message.type === "ticks") {
-      for (const tick of message.data) queueTick(tick);
-      const latest = message.data.at(-1);
+      for (const tick of data) queueTick(tick);
+      const latest = data.at(-1);
       if (latest) elements.lastUpdate.textContent = new Date(latest.timestamp).toLocaleTimeString();
     } else if (message.type === "candles") {
-      for (const candle of message.data) {
+      for (const candle of data) {
         state.candles.set(candle.symbol, candle);
         if (candle.symbol === state.selectedSymbol) updateSelectedChart(candle);
       }
-    } else if (message.type === "order_book" && message.data.symbol === state.selectedSymbol) {
+    } else if (message.type === "order_book" && message.data && message.data.symbol === state.selectedSymbol) {
       queueOrderBook(message.data);
     } else if (message.type === "indicators" && state.indicatorsEnabled) {
-      for (const indicator of message.data) {
+      for (const indicator of data) {
         if (indicator.symbol === state.selectedSymbol) updateIndicator(indicator);
       }
     } else if (message.type === "signals") {
-      const signal = message.data.find((item) => item.symbol === state.selectedSymbol);
+      const signal = data.find((item) => item.symbol === state.selectedSymbol);
       if (signal) renderLatestSignal(signal);
     } else if (message.type === "error") {
       elements.message.textContent = message.message;
     }
   });
   socket.addEventListener("close", () => {
+    if (state.socket !== socket) return;
     setConnection(false);
     const delay = Math.min(30000, 1000 * (2 ** state.reconnectAttempt));
     state.reconnectAttempt += 1;
-    window.setTimeout(connectSocket, delay);
+    state.reconnectTimer = window.setTimeout(connectSocket, delay);
   });
   socket.addEventListener("error", () => socket.close());
 }
@@ -770,7 +804,7 @@ function renderLevels(container, levels, side) {
     price.textContent = formatPrice(level.price);
     quantity.textContent = formatQuantity(level.quantity);
     actions.className = "depth-actions";
-    actions.innerHTML = `<button class="depth-action buy" type="button" data-trade-side="BUY" data-price="${level.price}" title="Buy at this price">B</button><button class="depth-action sell" type="button" data-trade-side="SELL" data-price="${level.price}" title="Sell at this price">S</button>`;
+    actions.innerHTML = `<button class="depth-action buy" type="button" data-trade-side="BUY" data-price="${escapeAttr(level.price)}" title="Buy at this price">B</button><button class="depth-action sell" type="button" data-trade-side="SELL" data-price="${escapeAttr(level.price)}" title="Sell at this price">S</button>`;
     row.append(price, quantity, actions);
     fragment.append(row);
   }
@@ -1084,7 +1118,7 @@ function renderPositions(positions) {
   elements.positionList.replaceChildren(...state.positions.map((position) => {
     const row = document.createElement("div");
     row.className = "management-row";
-    row.innerHTML = `<div><strong>Variant ${position.variant} · ${formatQuantity(position.quantity)}</strong><br><span>P&amp;L <span data-position-pnl="${position.variant}"></span></span></div><button type="button" data-square-off="${position.variant}">Square off</button>`;
+    row.innerHTML = `<div><strong>Variant ${escapeAttr(position.variant)} · ${formatQuantity(position.quantity)}</strong><br><span>P&amp;L <span data-position-pnl="${escapeAttr(position.variant)}"></span></span></div><button type="button" data-square-off="${escapeAttr(position.variant)}">Square off</button>`;
     return row;
   }));
   updateLivePositionPnl();
@@ -1109,8 +1143,8 @@ function updateLivePositionPnl(currentPrice) {
 }
 
 function renderClosedPositions(items, matches = []) {
-  elements.closedPositionCount.textContent = items.length ? `${items.length}` : "";
   if (!items.length && !matches.length) {
+    elements.closedPositionCount.textContent = "";
     elements.closedPositionList.innerHTML = "<small>No squared-off positions yet</small>";
     return;
   }
@@ -1150,6 +1184,20 @@ function escapeHtml(value) {
   const node = document.createElement("span");
   node.textContent = String(value ?? "");
   return node.innerHTML;
+}
+
+// escapeHtml's textContent round-trip does not encode quotes, so it is unsafe
+// inside an attribute value. Use this for any interpolated attribute.
+function escapeAttr(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]
+  ));
+}
+
+function toFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return NaN;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : NaN;
 }
 
 elements.positionList.addEventListener("click", async (event) => {
@@ -1203,10 +1251,6 @@ document.addEventListener("keydown", (event) => {
     setOrderType("MARKET");
   }
 });
-
-function formatNumber(value) {
-  return Number(value).toLocaleString(undefined, { maximumFractionDigits: 8 });
-}
 
 function formatPrice(value) {
   const number = Number(value);
@@ -1362,14 +1406,16 @@ async function loadIndicators(symbol) {
 
 function updateIndicator(indicator) {
   const time = Math.floor(new Date(indicator.timestamp).getTime() / 1000);
-  if (indicator.sma !== null) state.smaSeries.update({ time, value: Number(indicator.sma) });
-  if (indicator.ema !== null) state.emaSeries.update({ time, value: Number(indicator.ema) });
+  const sma = toFiniteNumber(indicator.sma);
+  const ema = toFiniteNumber(indicator.ema);
+  if (Number.isFinite(sma)) state.smaSeries.update({ time, value: sma });
+  if (Number.isFinite(ema)) state.emaSeries.update({ time, value: ema });
   renderIndicatorValues(indicator);
 }
 
 function renderIndicatorValues(indicator) {
-  elements.smaValue.textContent = indicator.sma === null ? "--" : formatPrice(indicator.sma);
-  elements.emaValue.textContent = indicator.ema === null ? "--" : formatPrice(indicator.ema);
+  elements.smaValue.textContent = Number.isFinite(toFiniteNumber(indicator.sma)) ? formatPrice(indicator.sma) : "--";
+  elements.emaValue.textContent = Number.isFinite(toFiniteNumber(indicator.ema)) ? formatPrice(indicator.ema) : "--";
 }
 
 function renderLatestSignal(signal) {
@@ -1411,24 +1457,41 @@ async function startDashboard() {
   dashboardStarted = true;
   try {
     await Promise.all([loadPublicConfig(), loadDashboard()]);
-    await loadOrderSession();
-    await loadStrategyStatus();
-    await loadAccountBalance().catch((error) => {
-      elements.accountFreeBalance.textContent = "Unavailable";
-      elements.accountInvestedBalance.textContent = "-- USDT";
-      elements.accountUtilization.textContent = "--%";
-      elements.accountBalanceStrip.hidden = false;
-      elements.message.textContent = error.message;
-    });
-    connectSocket();
-    window.setInterval(() => loadDashboard().catch(() => setConnection(false)), state.pollSeconds * 1000);
-    window.setInterval(() => refreshPositions().catch(() => {}), state.pollSeconds * 1000);
-    window.setInterval(() => loadAccountBalance().catch(() => {}), 15000);
-    window.setInterval(() => loadStrategyStatus().catch(() => {}), 10000);
   } catch (error) {
     elements.message.textContent = error.message;
     setConnection(false);
   }
+  // A failed optional request must not stop the live feed: each is isolated.
+  await loadOrderSession().catch(() => {});
+  await loadStrategyStatus().catch(() => {});
+  await loadAccountBalance().catch((error) => {
+    elements.accountFreeBalance.textContent = "Unavailable";
+    elements.accountInvestedBalance.textContent = "-- USDT";
+    elements.accountUtilization.textContent = "--%";
+    elements.accountBalanceStrip.hidden = false;
+    elements.message.textContent = error.message;
+  });
+  if (!elements.authScreen.hidden) return;
+  connectSocket();
+  state.pollTimers = [
+    window.setInterval(() => loadDashboard().catch(() => setConnection(false)), state.pollSeconds * 1000),
+    window.setInterval(() => refreshPositions().catch(() => {}), state.pollSeconds * 1000),
+    window.setInterval(() => loadAccountBalance().catch(() => {}), 15000),
+    window.setInterval(() => loadStrategyStatus().catch(() => {}), 10000),
+  ];
+}
+
+function stopDashboard() {
+  for (const timer of state.pollTimers) window.clearInterval(timer);
+  state.pollTimers = [];
+  window.clearTimeout(state.reconnectTimer);
+  state.reconnectTimer = null;
+  if (state.socket) {
+    const socket = state.socket;
+    state.socket = null; // Prevents the close handler from scheduling a reconnect.
+    socket.close();
+  }
+  dashboardStarted = false;
 }
 
 function setAuthTab(tab) {

@@ -1,7 +1,5 @@
 """Market-data models."""
 
-from decimal import Decimal
-
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .common import NonNegativeDecimal, PositiveDecimal, Symbol, UtcDateTime
@@ -19,7 +17,7 @@ class Tick(BaseModel):
 
 
 class Candle(BaseModel):
-    """A finalized or in-progress one-minute OHLC candle."""
+    """A finalized or in-progress OHLC candle for one configured interval."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -30,7 +28,7 @@ class Candle(BaseModel):
     high: PositiveDecimal
     low: PositiveDecimal
     close: PositiveDecimal
-    tick_count: int = Field(ge=1)
+    tick_count: int = Field(ge=0)
     volume: NonNegativeDecimal | None = None
     is_final: bool
 
@@ -38,10 +36,12 @@ class Candle(BaseModel):
     def validate_candle(self) -> "Candle":
         if self.interval_end <= self.interval_start:
             raise ValueError("interval_end must be after interval_start")
-        if self.interval_start.second or self.interval_start.microsecond:
-            raise ValueError("interval_start must be aligned to a minute boundary")
-        if (self.interval_end - self.interval_start).total_seconds() != 60:
-            raise ValueError("candle interval must be exactly one minute")
+        interval = (self.interval_end - self.interval_start).total_seconds()
+        if interval != int(interval):
+            raise ValueError("candle interval must be a whole number of seconds")
+        seconds = int(interval)
+        if int(self.interval_start.timestamp()) % seconds != 0:
+            raise ValueError("interval_start must align to a candle boundary")
         if self.high < max(self.open, self.close, self.low):
             raise ValueError("high must be the greatest OHLC value")
         if self.low > min(self.open, self.close, self.high):

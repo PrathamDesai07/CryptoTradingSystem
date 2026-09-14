@@ -8,6 +8,7 @@ from decimal import Decimal
 import inspect
 import json
 import logging
+from typing import Any
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -55,15 +56,21 @@ class CandleService:
         notifications: list[Candle] = []
 
         async with self._lock:
-            current = self._current.get(tick.symbol)
-            if current is not None and interval_start < current.interval_start:
+            history = self._history[tick.symbol]
+            last = history[-1] if history else None
+            if last is not None and interval_start <= last.interval_start:
                 logger.debug("late_tick_ignored symbol=%s", tick.symbol)
                 return
+            current = self._current.get(tick.symbol)
             if current is not None and interval_start > current.interval_start:
                 finalized = current.model_copy(update={"is_final": True})
-                self._history[tick.symbol].append(finalized)
+                history.append(finalized)
                 notifications.append(finalized)
+                last = finalized
                 current = None
+
+            if last is not None:
+                self._append_gap_fillers(tick.symbol, last, interval_start, notifications)
 
             if current is None:
                 current = Candle(
@@ -92,6 +99,43 @@ class CandleService:
 
         for candle in notifications:
             await self._notify(candle)
+
+    def _append_gap_fillers(
+        self,
+        symbol: str,
+        last: Candle,
+        target_start: datetime,
+        notifications: list[Candle],
+    ) -> None:
+        """Keep history contiguous by filling minutes that received no ticks.
+
+        Binance's own kline series never has holes, and the SMA/EMA window counts
+        samples rather than minutes, so skipped minutes would silently misalign it.
+        Fillers carry the previous close forward and therefore cannot create a
+        crossover on their own.
+        """
+        step = timedelta(seconds=self._interval_seconds)
+        cursor = last.interval_start + step
+        filled = 0
+        while cursor < target_start and filled < self._history_size:
+            filler = Candle(
+                symbol=symbol,
+                interval_start=cursor,
+                interval_end=cursor + step,
+                open=last.close,
+                high=last.close,
+                low=last.close,
+                close=last.close,
+                tick_count=0,
+                volume=None,
+                is_final=True,
+            )
+            self._history[symbol].append(filler)
+            notifications.append(filler)
+            cursor += step
+            filled += 1
+        if filled:
+            logger.info("candle_gap_filled symbol=%s count=%s", symbol, filled)
 
     async def current(self, symbol: str) -> Candle | None:
         async with self._lock:
@@ -133,7 +177,7 @@ class CandleService:
                     low=Decimal(row[3]),
                     close=Decimal(row[4]),
                     volume=Decimal(row[5]),
-                    tick_count=max(1, int(row[8])),
+                    tick_count=int(row[8]),
                     is_final=True,
                 )
                 for row in payload
@@ -188,7 +232,7 @@ class CandleService:
         interval_name: str,
         limit: int,
         timeout_seconds: float,
-    ) -> list[list[object]]:
+    ) -> list[list[Any]]:
         query = urlencode({"symbol": symbol, "interval": interval_name, "limit": limit})
         url = f"{rest_url.rstrip('/')}/api/v3/klines?{query}"
         with urlopen(url, timeout=timeout_seconds) as response:  # noqa: S310
@@ -221,17 +265,21 @@ class CandleService:
             except TimeoutError:
                 pass
 
-            finalized: list[Candle] = []
-            boundary = datetime.now(UTC)
-            async with self._lock:
-                for symbol, candle in tuple(self._current.items()):
-                    if candle.interval_end <= boundary:
-                        closed = candle.model_copy(update={"is_final": True})
-                        self._history[symbol].append(closed)
-                        self._current.pop(symbol, None)
-                        finalized.append(closed)
+            finalized = await self._finalize_due(datetime.now(UTC))
             for candle in finalized:
                 await self._notify(candle)
+
+    async def _finalize_due(self, boundary: datetime) -> list[Candle]:
+        """Finalize every in-progress candle whose interval has elapsed."""
+        finalized: list[Candle] = []
+        async with self._lock:
+            for symbol, candle in tuple(self._current.items()):
+                if candle.interval_end <= boundary:
+                    closed = candle.model_copy(update={"is_final": True})
+                    self._history[symbol].append(closed)
+                    self._current.pop(symbol, None)
+                    finalized.append(closed)
+        return finalized
 
     async def _notify(self, candle: Candle) -> None:
         if self._on_candle is None:

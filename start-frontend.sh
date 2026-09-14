@@ -13,7 +13,11 @@ fi
 cd "$frontend_root"
 if [[ ! -d node_modules ]]; then
   echo "Installing frontend dependencies..."
-  npm install --include=dev
+  if [[ -f package-lock.json ]]; then
+    npm ci --include=dev
+  else
+    npm install --include=dev
+  fi
 fi
 
 echo "Starting the frontend at http://localhost:3000. Press Ctrl+C to stop."

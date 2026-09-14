@@ -8,7 +8,6 @@ from .order_service import BinanceOrderError, OrderService
 from .pretrade_risk import PreTradeRiskEngine
 from .reconciliation_service import ReconciliationService
 from .strategy_service import StrategyService
-from .state_repository import StateRepository
 from .tick_broadcaster import TickBroadcaster
 from .tick_store import TickStore
 
@@ -22,7 +21,6 @@ __all__ = [
     "PreTradeRiskEngine",
     "ReconciliationService",
     "StrategyService",
-    "StateRepository",
     "TickBroadcaster",
     "TickStore",
 ]

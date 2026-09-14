@@ -39,6 +39,10 @@ class Settings(BaseModel):
     cors_allow_credentials: bool
     cors_allow_methods: list[str]
     cors_allow_headers: list[str]
+    # Optional regular expression of additional trusted origins (for example a
+    # preview-deployment pattern). Empty disables it; prefer an explicit
+    # CORS_ORIGINS allowlist in production.
+    cors_origin_regex: str = ""
 
     binance_api_key: SecretStr | None
     binance_api_secret: SecretStr | None
@@ -73,7 +77,6 @@ class Settings(BaseModel):
     frontend_tick_poll_seconds: float = Field(gt=0)
     frontend_broadcast_interval_milliseconds: int = Field(ge=16, le=5000)
     order_book_render_interval_milliseconds: int = Field(ge=100, le=5000)
-    order_size_usdt: float = Field(gt=0)
     max_order_balance_utilization_percent: float = Field(gt=0, le=100)
     max_order_notional_usdt: float = Field(gt=0)
     max_market_data_age_seconds: float = Field(gt=0)

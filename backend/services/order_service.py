@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 import hashlib
 import hmac
-import json
 import logging
 from time import monotonic, time
 from typing import Any, Awaitable, Callable
@@ -18,7 +17,7 @@ from pydantic import SecretStr
 
 from config import Settings
 from models import ExitReason, Position, PositionStatus, Signal, SignalAction, StrategyVariant, Tick
-from services.state_repository import StateRepository
+from services.db_handler import DatabaseHandler
 from services.pretrade_risk import PreTradeRiskEngine, PreTradeRiskError
 from services.reconciliation_service import ReconciliationService
 
@@ -102,7 +101,9 @@ class OrderService:
         self._shutdown_event = asyncio.Event()
         self._http_client: httpx.AsyncClient | None = None
         self._http_client_lock = asyncio.Lock()
-        self._repository = repository or StateRepository(settings.state_database_path, settings.strategy_signal_history_size)
+        self._repository = repository or DatabaseHandler(
+            settings.state_database_path, settings.strategy_signal_history_size
+        )
         self._risk = risk_engine or PreTradeRiskEngine(
             Decimal(str(settings.max_order_balance_utilization_percent)),
             Decimal(str(settings.max_order_notional_usdt)),
@@ -116,7 +117,7 @@ class OrderService:
             if client_id:
                 self._orders[client_id] = record
         for position in self._repository.load_positions():
-            key = (None, position.symbol, position.variant)
+            key: tuple[int | None, str, StrategyVariant] = (None, position.symbol, position.variant)
             self._positions[key] = position
             self._positions_by_symbol.setdefault(position.symbol, set()).add(key)
         if hasattr(self._repository, "load_user_positions"):
@@ -376,10 +377,11 @@ class OrderService:
         return {"symbol": symbol, "enabled": enabled, "expires_at": expires_at, "last_event": self._strategy_status.get(user_id)}
 
     def set_strategy_enabled(self, user_id: int, symbol: str, enabled: bool) -> dict[str, Any]:
-        expires_at = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=24) if enabled else None
         if enabled:
+            expires_at = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=24)
             self._strategy_symbols[(user_id, symbol)] = expires_at
         else:
+            expires_at = None
             self._strategy_symbols.pop((user_id, symbol), None)
         if hasattr(self._repository, "set_user_strategy_symbol"):
             self._repository.set_user_strategy_symbol(user_id, symbol, enabled, expires_at.isoformat().replace("+00:00", "Z") if expires_at else None)
@@ -524,7 +526,7 @@ class OrderService:
             try:
                 await self._ensure_market_fresh(normalized)
                 reservation = await self._risk.reserve(
-                    current_user_id.get(), normalized, rules, self.account, self._market_price,
+                    current_user_id.get(), normalized, rules, self.account, self._mark_price,
                     enforce_utilization=not bypass_utilization,
                 )
             except PreTradeRiskError as error:
@@ -592,7 +594,7 @@ class OrderService:
         if "quoteOrderQty" in order:
             notional = Decimal(order["quoteOrderQty"])
         elif "quantity" in order:
-            notional = Decimal(order["quantity"]) * await self._market_price(order["symbol"])
+            notional = Decimal(order["quantity"]) * await self._mark_price(order["symbol"])
         else:
             return
         if notional < minimum:
@@ -614,6 +616,16 @@ class OrderService:
     async def _market_price(self, symbol: str) -> Decimal:
         ticker = await self._public_request("GET", "/api/v3/ticker/price", {"symbol": symbol})
         return Decimal(str(ticker.get("price", "0")))
+
+    async def _mark_price(self, symbol: str) -> Decimal:
+        """Prefer the live streamed tick; fall back to REST only if it is missing or stale."""
+        if self._market_tick_loader is not None:
+            tick = await self._market_tick_loader(symbol)
+            if tick is not None:
+                age = (datetime.now(UTC) - tick.timestamp).total_seconds()
+                if age <= self._settings.max_market_data_age_seconds:
+                    return tick.price
+        return await self._market_price(symbol)
 
     async def _query_by_client_id(self, symbol: str, client_id: str) -> dict[str, Any]:
         result = await self._signed_request("GET", "/api/v3/order", {"symbol": symbol, "origClientOrderId": client_id})
@@ -945,6 +957,7 @@ class OrderService:
         stop = self._settings.variant_a_stop_loss_percent if signal.variant is StrategyVariant.A else self._settings.variant_b_stop_loss_percent
         entry_order_id = int(response["orderId"]) if response.get("orderId") is not None else None
         stop_price = price * (Decimal(1) - Decimal(str(stop)) / 100)
+        take_profit_price = price * (Decimal(1) + Decimal(str(self._settings.take_profit_percent)) / 100)
         try:
             protective = await self.place_order({
                 "symbol": signal.symbol, "side": "SELL", "type": "STOP_LOSS",
@@ -966,7 +979,8 @@ class OrderService:
                 logger.exception("protective_stop_emergency_exit_failed symbol=%s entry_order_id=%s", signal.symbol, entry_order_id)
             raise
         stop_loss_order_id = int(protective["orderId"]) if protective.get("orderId") is not None else None
-        position = Position(symbol=signal.symbol, variant=signal.variant, status=PositionStatus.OPEN, quantity=quantity, entry_price=price, current_price=price, current_pnl=Decimal(0), stop_loss_price=stop_price, take_profit_price=price * (Decimal(1) + Decimal(str(self._settings.take_profit_percent)) / 100), opened_at=signal.timestamp, entry_order_id=entry_order_id, stop_loss_order_id=stop_loss_order_id)
+        take_profit_order_id = await self._place_protective_take_profit(signal, quantity, take_profit_price, entry_order_id)
+        position = Position(symbol=signal.symbol, variant=signal.variant, status=PositionStatus.OPEN, quantity=quantity, entry_price=price, current_price=price, current_pnl=Decimal(0), stop_loss_price=stop_price, take_profit_price=take_profit_price, opened_at=signal.timestamp, entry_order_id=entry_order_id, stop_loss_order_id=stop_loss_order_id, take_profit_order_id=take_profit_order_id)
         async with self._lock:
             user_id = current_user_id.get()
             self._positions[(user_id, signal.symbol, signal.variant)] = position
@@ -979,6 +993,26 @@ class OrderService:
         else:
             await asyncio.to_thread(self._repository.save_position, position)
 
+    async def _place_protective_take_profit(self, signal: Signal, quantity: Decimal, take_profit_price: Decimal, entry_order_id: int | None) -> int | None:
+        """Submit the native take-profit, degrading to software-only on failure.
+
+        Unlike the stop loss, a missing take-profit is not dangerous: the position
+        still carries a native stop and the tick-driven software trigger, so the
+        entry is kept rather than unwound.
+        """
+        try:
+            protective = await self.place_order({
+                "symbol": signal.symbol, "side": "SELL", "type": "TAKE_PROFIT",
+                "quantity": str(quantity), "stopPrice": str(take_profit_price),
+                "newClientOrderId": f"ctsTP{signal.variant.value}{signal.symbol}{entry_order_id or int(signal.timestamp.timestamp())}"[:36],
+                "newOrderRespType": "FULL",
+                "_audit": {"source": "strategy", "strategy_variant": signal.variant.value, "protective_take_profit": True},
+            })
+        except BinanceOrderError:
+            logger.exception("protective_take_profit_submit_failed symbol=%s entry_order_id=%s", signal.symbol, entry_order_id)
+            return None
+        return int(protective["orderId"]) if protective.get("orderId") is not None else None
+
     async def _exit(self, key: PositionKey, fallback: Decimal, timestamp: datetime, reason: ExitReason) -> None:
         async with self._lock:
             position = self._positions.get(key)
@@ -986,7 +1020,7 @@ class OrderService:
                 return
             quantity = position.quantity
         _, symbol, variant = key
-        response = await self._resolve_protective_stop(position, symbol)
+        response = await self._resolve_protectives(position, symbol)
         if response is None:
             sell_quantity = await self._sellable_quantity(symbol, quantity)
             response = await self.place_order({"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(sell_quantity), "newClientOrderId": f"cts{variant.value}{symbol}S{int(timestamp.timestamp())}"[:36], "newOrderRespType": "FULL", "_audit": {"source": "strategy", "strategy_variant": variant.value, "exit_reason": reason.value}})
@@ -1010,11 +1044,26 @@ class OrderService:
                     closed_at=None if remaining > 0 else timestamp,
                     exit_order_ids=exit_order_ids,
                     stop_loss_order_id=None,
+                    take_profit_order_id=None,
                 )
                 self._positions[key] = Position.model_validate(updated)
                 saved_position = self._positions[key]
-                if self._history:
-                    self._history[-1].update(exit_reason=reason.value, strategy_variant=variant.value)
+                # Stamp only the record that corresponds to this exit order; the
+                # process-global history is shared, so indexing the last entry
+                # blindly could relabel an unrelated order.
+                exit_client_id = str(response.get("clientOrderId") or "")
+                for record in reversed(self._history):
+                    matches_client = bool(exit_client_id) and str(
+                        record.get("clientOrderId") or record.get("newClientOrderId") or ""
+                    ) == exit_client_id
+                    matches_order = (
+                        exit_order_id is not None
+                        and record.get("orderId") is not None
+                        and str(record["orderId"]) == str(exit_order_id)
+                    )
+                    if matches_client or matches_order:
+                        record.update(exit_reason=reason.value, strategy_variant=variant.value)
+                        break
             else:
                 saved_position = None
         if saved_position is not None:
@@ -1022,7 +1071,7 @@ class OrderService:
                 await asyncio.to_thread(self._repository.save_user_position, key[0], saved_position)
             else:
                 await asyncio.to_thread(self._repository.save_position, saved_position)
-        if saved_position is not None and saved_position.entry_order_id is not None:
+        if saved_position is not None and position is not None and saved_position.entry_order_id is not None:
             await self._record_order_match(
                 key[0], symbol,
                 {"orderId": saved_position.entry_order_id, "side": "BUY", "status": "FILLED", "executedQty": str(position.quantity), "price": str(position.entry_price)},
@@ -1036,21 +1085,35 @@ class OrderService:
         ):
             await asyncio.to_thread(self._repository.record_position_history, key[0], saved_position, reason.value)
 
-    async def _resolve_protective_stop(self, position: Position, symbol: str) -> dict[str, Any] | None:
-        """Use a filled native stop, or cancel it before another exit order."""
-        if position.stop_loss_order_id is None:
-            return None
-        try:
-            existing = await self.query_order(symbol, position.stop_loss_order_id, None)
-        except BinanceOrderError:
-            existing = None
-        if existing and existing.get("status") == "FILLED":
-            return existing
-        try:
-            await self.cancel_order(symbol, position.stop_loss_order_id, None)
-        except BinanceOrderError:
-            logger.warning("protective_stop_cancel_failed symbol=%s order_id=%s", symbol, position.stop_loss_order_id)
-        return None
+    async def _resolve_protectives(self, position: Position, symbol: str) -> dict[str, Any] | None:
+        """Return a filled protective order and cancel whichever remain.
+
+        Either the stop loss or the take profit can have triggered natively at the
+        exchange first, so both are checked before submitting any exit order. The
+        survivor is cancelled to avoid a lingering sell against a flat position.
+        """
+        order_ids = [
+            order_id
+            for order_id in (position.stop_loss_order_id, position.take_profit_order_id)
+            if order_id is not None
+        ]
+        filled: dict[str, Any] | None = None
+        for order_id in order_ids:
+            try:
+                existing = await self.query_order(symbol, order_id, None)
+            except BinanceOrderError:
+                existing = None
+            if existing and existing.get("status") == "FILLED" and filled is None:
+                filled = existing
+        filled_id = int(filled["orderId"]) if filled and filled.get("orderId") is not None else None
+        for order_id in order_ids:
+            if order_id == filled_id:
+                continue
+            try:
+                await self.cancel_order(symbol, order_id, None)
+            except BinanceOrderError:
+                logger.warning("protective_cancel_failed symbol=%s order_id=%s", symbol, order_id)
+        return filled
 
     async def _sellable_quantity(self, symbol: str, requested: Decimal) -> Decimal:
         """Return the spendable base quantity accepted by Binance market filters.
@@ -1209,7 +1272,7 @@ class OrderService:
             exit_price = Decimal(str(exit.get("cummulativeQuoteQty", "0"))) / exit_quantity
         if quantity <= 0 or entry_price <= 0 or exit_price <= 0:
             return
-        match = {"symbol": symbol, "entry_order_id": int(entry["orderId"]), "exit_order_id": int(exit["orderId"]), "entry_side": str(entry.get("side") or "BUY"), "exit_side": str(exit.get("side") or "SELL"), "quantity": quantity, "entry_price": entry_price, "exit_price": exit_price, "realized_pnl": (exit_price - entry_price) * quantity, "recorded_at": datetime.now(UTC).isoformat()}
+        match: dict[str, Any] = {"symbol": symbol, "entry_order_id": int(entry["orderId"]), "exit_order_id": int(exit["orderId"]), "entry_side": str(entry.get("side") or "BUY"), "exit_side": str(exit.get("side") or "SELL"), "quantity": quantity, "entry_price": entry_price, "exit_price": exit_price, "realized_pnl": (exit_price - entry_price) * quantity, "recorded_at": datetime.now(UTC).isoformat()}
         async with self._lock:
             self._order_matches[(user_id, match["entry_order_id"], match["exit_order_id"])] = match
             key = (user_id, symbol, match["entry_order_id"])
@@ -1258,7 +1321,12 @@ class OrderService:
 
     def metrics(self) -> dict[str, Any]:
         values = sorted(self._request_latencies_ms)
-        percentile = lambda fraction: values[min(len(values) - 1, int((len(values) - 1) * fraction))] if values else 0.0
+
+        def percentile(fraction: float) -> float:
+            if not values:
+                return 0.0
+            return values[min(len(values) - 1, int((len(values) - 1) * fraction))]
+
         return {
             **self._metric_counts,
             "active_tasks": len(self._background_tasks),
