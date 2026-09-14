@@ -143,7 +143,7 @@ class DatabaseHandler:
                     handle.write(b"0")
                     handle.flush()
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
             else:
                 import fcntl
 
@@ -166,7 +166,7 @@ class DatabaseHandler:
                     import msvcrt
 
                     lease.seek(0)
-                    msvcrt.locking(lease.fileno(), msvcrt.LK_UNLCK, 1)
+                    msvcrt.locking(lease.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
                 else:
                     import fcntl
 
